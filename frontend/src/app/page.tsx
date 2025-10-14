@@ -1,26 +1,75 @@
 'use client';
 
 import { useState, useEffect } from 'react';
+import StartPageContent from './StartPageContent';
+import MungsaengPage from './mungsaeng/MungsaengPage';
+import ProfilePage from './profile/ProfilePage';
+import SelectStep from './profile/SelectStep';
+import CreateStep from './profile/CreateStep';
+import AdoptionCreateStep from './profile/AdoptionCreateStep';
+import StudioCreateStep from './profile/StudioCreateStep';
+import LoadingSpinner from '@/components/ui/LoadingSpinner';
+import ReadyStep from './profile/ReadyStep';
+
+type PageState = 'start' | 'mungsaeng' | 'profile' | 'profileSelect' | 'profileCreate' | 'profileAdoptionCreate' | 'studioCreate' | 'profileGenerating' | 'profileReady';
 
 export default function Home() {
-  const [message, setMessage] = useState('로딩 중...');
+  const [currentPage, setCurrentPage] = useState<PageState>('start');
+  const goToHome = () => setCurrentPage('start');
 
   useEffect(() => {
-    fetch('http://127.0.0.1:8000/api/test')
-      .then((res) => res.json())
-      .then((data) => {
-        setMessage(data.message);
-      })
-      .catch(() => {
-        setMessage('백엔드 서버에 연결할 수 없습니다. 서버가 켜져 있는지 확인하세요.');
-      });
-  }, []);
+    if (currentPage === 'profileGenerating') {
+      const timer = setTimeout(() => {
+        setCurrentPage('profileReady');
+      }, 3000);
+      return () => clearTimeout(timer);
+    }
+  }, [currentPage]);
 
-  return (
-    <main style={{ padding: '2rem' }}>
-      <h1>Pimfy AI 프로필 스튜디오🐾</h1>
-      <p>백엔드로부터 받은 메시지:</p>
-      <p style={{ color: 'blue', fontWeight: 'bold' }}>{message}</p>
-    </main>
-  );
+  const handleSelectProfileType = (type: 'pimfy' | 'adoption' | 'studio') => {
+    if (type === 'pimfy') {
+      setCurrentPage('profileCreate');
+    } else if (type === 'adoption') {
+      setCurrentPage('profileAdoptionCreate');
+    } else if (type === 'studio') {
+      setCurrentPage('studioCreate');
+    }
+  }
+
+  const handleCreateComplete = () => {
+    setCurrentPage('profileGenerating');
+  }
+
+  const renderPage = () => {
+    switch (currentPage) {
+      case 'mungsaeng':
+        return <MungsaengPage onBack={() => setCurrentPage('profile')} onGoHome={goToHome} />;
+
+      case 'profileGenerating':
+        return <LoadingSpinner mainText="견생 프로필" subText="(사진 생성중)" />;
+
+      case 'profileReady':
+        return (
+          <div className="flex min-h-screen items-center justify-center bg-mint p-4">
+            <ReadyStep onRetry={() => setCurrentPage('profileSelect')} onGoHome={goToHome} />
+          </div>
+        );
+
+      case 'profileCreate':
+        return <CreateStep onBack={() => setCurrentPage('profileSelect')} onComplete={handleCreateComplete} />;
+      case 'profileAdoptionCreate':
+        return <AdoptionCreateStep onBack={() => setCurrentPage('profileSelect')} onComplete={handleCreateComplete} />;
+      case 'studioCreate':
+        return <StudioCreateStep onBack={() => setCurrentPage('profileSelect')} onComplete={handleCreateComplete} />;
+      case 'profileSelect':
+        return <SelectStep onBack={() => setCurrentPage('profile')} onSelect={handleSelectProfileType} />;
+      case 'profile':
+        return <ProfilePage onBack={goToHome} onNavigate={setCurrentPage} />;
+      case 'start':
+      default:
+        return <StartPageContent onNavigate={setCurrentPage} />;
+    }
+  };
+
+  return <main>{renderPage()}</main>;
 }

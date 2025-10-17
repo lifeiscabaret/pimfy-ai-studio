@@ -1,1 +1,14 @@
 node_modules
+
+# Local/editor
+settings.json
+.vscode/
+.DS_Store
+
+# Secrets
+*.env
+
+# Build
+node_modules/
+.next/
+__pycache__/

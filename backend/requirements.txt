@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+torch
+transformers
+diffusers
+accelerate
+python-multipart
+mysql-connector-python

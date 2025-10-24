@@ -12,6 +12,8 @@ COPY requirements.txt .
 
 # 5. 재료 목록에 있는 모든 파이썬 라이브러리 설치.
 RUN pip install --no-cache-dir -r requirements.txt
+# (!!) .env 파일을 읽기 위한 python-dotenv 라이브러리 추가.
+RUN pip install python-dotenv
 
 # 6. 현재 폴더의 나머지 모든 소스 코드(main.py 등)를 복사.
 COPY . .

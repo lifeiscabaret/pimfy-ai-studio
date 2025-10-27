@@ -11,18 +11,20 @@ from io import BytesIO
 import asyncio
 import databases
 import sqlalchemy
+import requests # 추가 (이미지다운로드 로직)
 from PIL import Image # <-- 이미지 처리용
 from rembg import remove # <-- 배경 제거용
 
 # --- 1. Cafe24 DB (MySQL) 설정 (보안 강화!) ---
 load_dotenv() # .env 파일 로드
 DATABASE_URL = os.getenv("DATABASE_URL") # 환경 변수에서 읽기
-IMAGE_BASE_PATH = os.getenv("IMAGE_BASE_PATH", "/www/inday_fileinfo/img") # .env에서 읽기 (없을 경우 기본값 사용)
+# IMAGE_BASE_PATH는 .env 파일에서 읽어옴 (올바른 웹 경로: /inday_fileinfo/img)
+IMAGE_BASE_PATH = os.getenv("IMAGE_BASE_PATH", "/inday_fileinfo/img") # 기본값 설정
 
 if not DATABASE_URL:
     print("🚨 치명적 에러: .env 파일에 DATABASE_URL이 설정되지 않았습니다! 서버를 시작할 수 없습니다.")
     # 실제 운영 시에는 여기서 에러를 발생시키거나 기본값 설정 필요
-    raise ValueError("DATABASE_URL 환경 변수가 설정되지 않았습니다.") 
+    raise ValueError("DATABASE_URL 환경 변수가 설정되지 않았습니다.")
 
 database = databases.Database(DATABASE_URL)
 metadata = sqlalchemy.MetaData()
@@ -33,7 +35,7 @@ dogs_table = sqlalchemy.Table(
     metadata,
     sqlalchemy.Column("uid", sqlalchemy.Integer, primary_key=True),
     sqlalchemy.Column("subject", sqlalchemy.String(250)),      # 유기견 이름
-    sqlalchemy.Column("s_pic01", sqlalchemy.String(150)),      # 이미지 파일 (경로!)
+    sqlalchemy.Column("s_pic01", sqlalchemy.String(150)),      # 이미지 파일 (파일명!)
     sqlalchemy.Column("addinfo03", sqlalchemy.String(10)),       # 성별
     sqlalchemy.Column("addinfo04", sqlalchemy.String(10)),       # 중성화 여부
     sqlalchemy.Column("addinfo05", sqlalchemy.String(10)),       # 출생 시기 (나이)
@@ -82,9 +84,8 @@ def load_models_and_db():
 
     # (!!) Image-to-Image 파이프라인 로드 (SD 1.5 기반)
     print("Loading Stable Diffusion Image-to-Image pipeline...")
-    # SDXL Image-to-Image는 다른 모델 ID를 사용할 수 있음 (나중에 업그레이드 고려)
     models["image_pipe"] = StableDiffusionImg2ImgPipeline.from_pretrained(
-        "runwayml/stable-diffusion-v1-5", # <-- 우선 SD 1.5 img2img 사용
+        "runwayml/stable-diffusion-v1-5",
         torch_dtype=torch.float16,
     ).to(device)
 
@@ -122,7 +123,6 @@ async def get_dog_list(search: str | None = None):
             (dogs_table.c.subject.ilike(f"%{search}%")) |
             (dogs_table.c.addinfo10.ilike(f"%{search}%"))
         )
-    # Pydantic v1 호환성을 위해 RowProxy를 dict로 변환 (FastAPI 구버전 등에서 필요할 수 있음)
     results = await db.fetch_all(query)
     return [dict(row) for row in results]
 
@@ -134,7 +134,6 @@ async def get_dog_details(dog_uid: int):
     dog = await db.fetch_one(query)
     if not dog:
         raise HTTPException(status_code=404, detail="해당 ID의 강아지 정보를 찾을 수 없습니다.")
-    # Pydantic v1 호환성을 위해 RowProxy를 dict로 변환
     return dict(dog)
 
 
@@ -147,43 +146,79 @@ async def generate_real_profile(request: RealProfileRequest):
     dog_dict = await get_dog_details(request.dog_uid)
     dog = Dog(**dog_dict) # Pydantic 모델로 변환
 
-    # --- 이미지 처리 ---
+    original_rgb_image_base64 = None # 원본 이미지의 Base64를 저장할 변수
+
+    # --- 이미지 처리 (HTTP 다운로드 방식) ---
     img_str = "Error processing image" # 기본값
     try:
-        image_path = dog.s_pic01
-# (!!) Cafe24 서버의 '절대 파일 경로'로 이미지를 직접 열어야 함.
-        image_folder_path = IMAGE_BASE_PATH
-        
-        if not dog.s_pic01:
-            raise ValueError("DB에 이미지 경로(s_pic01)가 없습니다.")
+        # .env에서 URL 정보 읽기
+        SITE_BASE_URL = "https://www.pimfyvirus.com" # (하드코딩)
+        IMAGE_WEB_PATH = IMAGE_BASE_PATH # .env에서 "/inday_fileinfo/img"를 읽어옴 (따옴표 없이!)
 
-        # os.path.join을 사용해 절대 경로 조합 (예: /www/inday_fileinfo/img/filename.jpg)
-        full_file_path = os.path.join(image_folder_path, dog.s_pic01)
-        
-        print(f"서버 내부 경로에서 이미지 여는 중: {full_file_path}")
-        
-        if not os.path.exists(full_file_path):
-            print(f"경고: 파일을 찾을 수 없습니다! {full_file_path}")
-            raise HTTPException(status_code=404, detail=f"Image file not found at path: {full_file_path}")
-            
-        # HTTP 요청 대신 파일 시스템에서 직접 이미지를 열고
-        input_image = Image.open(full_file_path).convert("RGB")
+        if not dog.s_pic01:
+            raise ValueError("DB에 이미지 파일명(s_pic01)이 없습니다.")
+
+        # 'https://.../inday_fileinfo/img/filename.jpg' URL 조합
+        image_url = f"{SITE_BASE_URL}{IMAGE_WEB_PATH}/{dog.s_pic01}"
+
+        print(f"이미지 다운로드 시도: {image_url}")
+
+        # Requests로 이미지 다운로드
+        response = requests.get(image_url, stream=True)
+        response.raise_for_status() # 404 등 에러가 나면 여기서 멈춤
+
+        print("이미지 다운로드 성공, PIL로 여는 중...")
+
+        # 다운로드한 이미지를 PIL로 열기
+        input_image = Image.open(response.raw).convert("RGB")
+
+        # --- (새로운 기능!) 원본 이미지를 Base64로 저장해두기 ---
+        buffered_original = BytesIO()
+        input_image.save(buffered_original, format="PNG")
+        original_rgb_image_base64 = base64.b64encode(buffered_original.getvalue()).decode("utf-8")
+        # ----------------------------------------------------
 
         print("배경 제거 시작...")
-        # (!!) alpha_matting=True 옵션 추가 (선택적, 더 나은 품질 위해)
-        output_image = remove(input_image, alpha_matting=True) # RGBA
+        # `only_mask=True`를 사용해 마스크만 추출 후 원본 이미지와 합성하는 방식도 고려 가능
+        output_image = remove(input_image, alpha_matting=True)
         print("배경 제거 완료.")
 
-        # Image-to-Image 입력 준비 (배경 제거된 이미지 사용)
-        output_image = output_image.resize((512, 512)) # SD 1.5 기본 해상도
-        # RGBA -> RGB 변환 (흰색 배경)
-        rgb_image = Image.new("RGB", output_image.size, (255, 255, 255))
-        rgb_image.paste(output_image, mask=output_image.split()[3])
+        output_image = output_image.resize((512, 512))
+        # 배경 제거 후 투명한 부분을 흰색으로 채움 (Stable Diffusion 입력용)
+        rgb_image_for_sd = Image.new("RGB", output_image.size, (255, 255, 255))
+        rgb_image_for_sd.paste(output_image, mask=output_image.split()[3])
+
+        # --- (✨ 중요!) 긍정 & 부정 프롬프트 생성 ---
+        dog_name = dog.subject if dog.subject else "this dog"
+        personality_tags = f", {dog.addinfo08}" if dog.addinfo08 else ""
+
+        # 긍정 프롬프트: 원하는 결과물 (스튜디오 품질, 선명함 강조)
+        prompt_image = f"""
+        professional studio portrait photo of {dog_name}{personality_tags}, centered, medium shot view, high resolution,
+        masterpiece, best quality, sharp focus, highly detailed fur texture, natural lighting, photo-realistic, cinematic quality,
+        plain light gray background
+        """.strip().replace("\n", " ") # 줄바꿈 제거
+
+        # 부정 프롬프트: 피해야 할 요소들 (흐릿함, 저퀄리티, 배경 요소 제거)
+        negative_prompt = """
+        blurry, low quality, worst quality, unclear, unfocused, distorted, disfigured, ugly, deformed, bad anatomy, extra limbs, missing limbs, mutated hands, mutation,
+        cartoon, drawing, sketch, illustration, painting, anime, 3d render, illustration, drawing, painting, sketch, cartoon, anime, manga, doll, toy, plastic, fake
+        watermark, text, signature, words, letters, noise, grain, artifacts, compression artifacts, jpeg artifacts, overexposed, underexposed, bad lighting, multiple dogs, human, person, hands, feet,
+        cage, bars, leash, harness, chain, wires, fence, outdoor, nature, grass, trees, buildings, furniture, messy background, cluttered background
+        """.strip().replace("\n", " ") # 줄바꿈 제거
+
+        print(f"Using Image Prompt: {prompt_image}")
+        print(f"Using Negative Prompt: {negative_prompt}")
 
         print("이미지 개선 시작...")
-        prompt_image = f"high-quality professional studio photo of this cute dog named {dog.subject}, realistic, masterpiece, best quality, centered, plain light gray background" # 배경색 지정
-        # strength 낮추면 원본 유지력 상승, 높이면 AI 창의성 증가
-        enhanced_image = models["image_pipe"](prompt=prompt_image, image=rgb_image, strength=0.6, guidance_scale=7.5).images[0]
+        # (!!!) strength 값 조절: 특이한 이미지의 경우 더 낮게 (0.3~0.4) 설정하여 원본 형태 유지
+        enhanced_image = models["image_pipe"](
+            prompt=prompt_image,
+            negative_prompt=negative_prompt,
+            image=rgb_image_for_sd,
+            strength=0.35, # <-- ★★★ 이 값을 0.3~0.45 정도로 낮춰서 테스트해보세요!
+            guidance_scale=8.0
+        ).images[0]
         print("이미지 개선 완료.")
 
         buffered = BytesIO()
@@ -192,54 +227,75 @@ async def generate_real_profile(request: RealProfileRequest):
 
     except Exception as e:
         print(f"이미지 처리 중 오류 발생: {e}")
-        # 이미지 처리 실패 시에도 텍스트는 생성하도록 계속 진행
+        # (!!) 이미지 생성 실패 시, 원본 이미지를 그대로 반환하도록 처리
+        if original_rgb_image_base64:
+            img_str = original_rgb_image_base64
+            print("AI 이미지 생성 실패, 원본 이미지를 대신 반환합니다.")
+        else:
+            img_str = "Error: Could not process or retrieve image." # 원본도 없는 경우
 
     # --- 텍스트 생성 ---
+    # (✨ 수정 제안) 데이터 전처리 예시 (간단 버전)
+    def clean_text(text):
+        if not text: return ""
+        # 간단하게 HTML 태그 제거 (더 강력한 방법 필요할 수 있음)
+        import re
+        text = re.sub(r'<[^>]+>', '', text)
+        return text.strip()
+
+    dog_subject = clean_text(dog.subject)
+    dog_gender = clean_text(dog.addinfo03)
+    dog_birth = clean_text(dog.addinfo05)
+    dog_weight = clean_text(dog.addinfo07)
+    dog_neuter = clean_text(dog.addinfo04)
+    dog_tags = clean_text(dog.addinfo08)
+    dog_personality = clean_text(dog.addinfo10)
+    dog_story = clean_text(dog.addinfo09)
+    dog_illness = clean_text(dog.addinfo19)
+    dog_etc = clean_text(dog.addinfo11)
+
+
     prompt_text = f"""
     # MISSION (임무)
-    당신은 국내 최고의 동물 구조 전문 카피라이터입니다.
-    당신의 유일한 임무는, 아래 [견종 정보]를 가진 유기견에게 '평생 가족'을 찾아주는 것입니다.
-    이 아이가 아니면 안 되겠다는 '운명적인 끌림'을 느끼게 만드는, 감성적이고 임팩트 있는 프로필을 작성해 주세요.
+    당신은 유기동물 입양 홍보 전문 카피라이터입니다. [견종 정보]만을 이용해서, 이 아이의 매력과 사연이 잘 드러나는 감성적인 입양 프로필 소개글을 작성해야 합니다.
 
     # INSTRUCTIONS (작성 지침)
-    1.  **내용 충실:** [견종 정보]에 있는 사실만을 바탕으로 작성해야 합니다.
-    2.  **단점 승화:** 아이의 아픈 '사연'이나 '병력'은 '극복과 희망'으로, '특징'은 '매력'으로 승화시켜 주세요.
-    3.  **감성 자극:** 독자의 마음을 움직이고, 이 아이와 함께하는 미래를 그리고 싶다는 '핵심 욕구'를 자극해 주세요.
-    4.  **어조:** 따뜻하고 다정한 관찰자 시점으로 작성해 주세요. (1인칭 X)
+    1.  **[견종 정보] 활용:** 반드시 아래 제공된 [견종 정보] 내용만을 바탕으로 작성하세요. **정보에 없는 내용은 절대 지어내지 마세요.**
+    2.  **긍정적 관점:** 아픈 사연이나 건강 문제는 '극복'과 '희망'의 관점에서 긍정적으로 표현해주세요. 특징은 매력으로 강조해주세요.
+    3.  **감성적 호소:** 입양 희망자가 이 아이와 함께하는 미래를 꿈꾸게 만들고, 아이에게 깊은 애정을 느끼도록 감성적으로 작성해주세요.
+    4.  **관찰자 시점:** 따뜻하고 다정한 3인칭 관찰자 시점으로 작성해주세요. (예: "밤이는 애교가 많아요.")
+    5.  **분량:** 2~3 문단 정도의 너무 길지 않은 소개글로 작성해주세요.
 
     # 견종 정보 (Dog's Data)
-    - 이름: {dog.subject}
-    - 성별: {dog.addinfo03}
-    - 나이(출생시기): {dog.addinfo05}
-    - 몸무게: {dog.addinfo07}kg
-    - 중성화: {dog.addinfo04}
-    - 성격 태그: {dog.addinfo08}
-    - 성격 및 특징: {dog.addinfo10}
-    - 구조 사연: {dog.addinfo09}
-    - 병력 사항: {dog.addinfo19}
-    - 기타 사항: {dog.addinfo11}
+    - 이름: {dog_subject}
+    - 성별: {dog_gender}
+    - 나이(추정): {dog_birth}
+    - 몸무게: {dog_weight}kg
+    - 중성화: {dog_neuter}
+    - 성격 태그: {dog_tags}
+    - 성격 및 특징: {dog_personality}
+    - 구조 사연: {dog_story}
+    - 병력/건강: {dog_illness}
+    - 기타: {dog_etc}
     ---
     # PROFILE (프로필 작성)
     소개글:
     """
+    print(f"DEBUG: Text Prompt:\n{prompt_text}") # <-- 디버깅용: 실제 프롬프트 확인
 
-    generated_text = "Error generating text" # 기본값
+    generated_text = "Error generating text"
     try:
         inputs = models["tokenizer"](prompt_text, return_tensors="pt").to(models["text_model"].device)
         output_sequences = models["text_model"].generate(
             input_ids=inputs['input_ids'],
             attention_mask=inputs['attention_mask'],
             max_new_tokens=300,
-            temperature=0.7,
+            temperature=0.6,  # <--- ✨ 0.7에서 0.6 정도로 낮춰서 무작위성 감소
             repetition_penalty=1.2,
-            # (!!) early_stopping=True 추가 (생성 완료 시 빠르게 종료)
             early_stopping=True
         )
-        # (!!) 텍스트 깨짐 해결 시도 (v6 유지)
         decoded_text = models["tokenizer"].decode(output_sequences[0], skip_special_tokens=True, clean_up_tokenization_spaces=True)
         generated_text = decoded_text.split("소개글:")[-1].strip()
-        # (!!) 추가: 만약 그래도 깨진다면 UTF-8 강제 인코딩/디코딩 시도 (하지만 보통 decode가 처리함)
-        # generated_text = generated_text.encode('latin1').decode('utf-8', errors='ignore')
     except Exception as e:
         print(f"텍스트 생성 중 오류 발생: {e}")
 

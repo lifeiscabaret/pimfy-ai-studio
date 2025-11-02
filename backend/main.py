@@ -21,7 +21,7 @@ from basicsr.archs.rrdbnet_arch import RRDBNet
 from realesrgan import RealESRGANer
 
 # --- (✨ 추가!) Pillow 효과 ---
-from PIL import Image, ImageDraw, ImageFont, ImageFilter 
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 # --- DB ---
 import databases
@@ -367,7 +367,7 @@ async def generate_real_profile(request: RealProfileRequest):
         final_image_base64 = original_rgb_image_base64
     else:
         # (유효한 이미지가 아예 없는 경우)
-        print(f"[{uid}] !! 치명적 오류: 유효한 이미지가 없어 프로필 생성을 중단합니다.")
+        print(f"[{dog.uid}] !! 치명적 오류: 유효한 이미지가 없어 프로필 생성을 중단합니다.")
         generated_text = "프로필을 생성할 수 없습니다: 유효한 원본 이미지가 없습니다."
         final_image_base64 = ""
         
@@ -434,8 +434,8 @@ async def generate_marketing_image(request: MarketingProfileRequest):
     generated_text = generate_dog_text(dog, models["tokenizer"], models["text_model"])
 
     if not best_input_image_pil:
-         final_image_base64 = "Error: No valid source image."
-         generated_text = "프로필을 생성할 수 없습니다: 유효한 원본 이미지가 없습니다."
+        final_image_base64 = "Error: No valid source image."
+        generated_text = "프로필을 생성할 수 없습니다: 유효한 원본 이미지가 없습니다."
 
     return {
         "profile_text": generated_text,

@@ -16,5 +16,4 @@ torch==2.2.0
 torchvision==0.17.0
 transformers
 uvicorn[standard]
-git+https://github.com/xinntao/BasicSR.git
 git+https://github.com/xinntao/Real-ESRGAN.git

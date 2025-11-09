@@ -11,7 +11,7 @@ import asyncio
 import re
 import textwrap
 import requests
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Union
 
 # --- DB ---
 import databases
@@ -25,8 +25,7 @@ from realesrgan import RealESRGANer
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 # (✨ v30 적용) GPT-4o 사용
-import openai 
-from openai import OpenAI # 1.x 버전 클라이언트 사용
+import openai # openai>=1.0.0 버전 클라이언트 사용
 
 # --- 1. 환경 변수 및 DB 설정 ---
 load_dotenv()
@@ -41,14 +40,14 @@ if not DATABASE_URL:
 database = databases.Database(DATABASE_URL)
 metadata = sqlalchemy.MetaData()
 
-# 'homeprotection' 테이블 정의 (DB 스키마 복구)
+# 'homeprotection' 테이블 정의 (기존 유지)
 dogs_table = sqlalchemy.Table(
     "homeprotection",
     metadata,
     sqlalchemy.Column("uid", sqlalchemy.Integer, primary_key=True),
     sqlalchemy.Column("subject", sqlalchemy.String(250)),
     sqlalchemy.Column("s_pic01", sqlalchemy.String(150)),
-    sqlalchemy.Column("addinfo01", sqlalchemy.String(100)),
+    sqlalchemy.Column("addinfo01", sqlalchemy.String(100)), # 레거시 텍스트 필드는 구조 유지를 위해 정의만 남김
     sqlalchemy.Column("addinfo02", sqlalchemy.String(100)),
     sqlalchemy.Column("addinfo12", sqlalchemy.String(250)),
     sqlalchemy.Column("addinfo15", sqlalchemy.String(250)),
@@ -63,16 +62,24 @@ dogs_table = sqlalchemy.Table(
     sqlalchemy.Column("addinfo19", sqlalchemy.String(250)),
 )
 
+# homeprotectionsub02 테이블 정의 추가
+sub02_table = sqlalchemy.Table(
+    "homeprotectionsub02",
+    metadata,
+    sqlalchemy.Column("puid", sqlalchemy.Integer), # homeprotection.uid와 연결됨
+    sqlalchemy.Column("s_pic01", sqlalchemy.String(150)),
+    sqlalchemy.Column("num", sqlalchemy.Integer), 
+)
+
 
 # --- 2. Pydantic 모델 정의 (DB 스키마) ---
 class Dog(BaseModel):
     uid: int
     subject: str
     s_pic01: Optional[str] = None
-    addinfo01: Optional[str] = None
-    addinfo02: Optional[str] = None
-    addinfo12: Optional[str] = None
-    addinfo15: Optional[str] = None
+    # 새로운 이미지 파일명 리스트 추가
+    image_filenames: List[str] = [] 
+    
     addinfo03: Optional[str] = None
     addinfo04: Optional[str] = None
     addinfo05: Optional[str] = None
@@ -156,13 +163,27 @@ async def get_db_connection():
     return database
 
 # (✨ v38 수정) DB에서 강아지 정보를 가져오는 함수 (실제 로직)
+# 🚨 Task 5 반영: homeprotectionsub02 테이블에서 이미지 파일명을 조회하도록 수정
 async def get_dog_details(dog_uid: int) -> Dog:
     db = await get_db_connection()
-    query = dogs_table.select().where(dogs_table.c.uid == dog_uid)
-    dog_data = await db.fetch_one(query)
+    
+    # 1. homeprotection (주요 정보 및 s_pic01) 조회
+    main_query = dogs_table.select().where(dogs_table.c.uid == dog_uid)
+    dog_data = await db.fetch_one(main_query)
+    
     if not dog_data:
         raise HTTPException(status_code=404, detail=f"UID {dog_uid}에 해당하는 강아지 정보를 DB에서 찾을 수 없습니다.")
-    return Dog(**dog_data)
+
+    # 2. homeprotectionsub02에서 파일명 조회
+    # puid == dog_uid를 조건으로, num으로 정렬하여 갤러리 파일 목록을 가져옵니다.
+    image_query = sub02_table.select().where(sub02_table.c.puid == dog_uid).order_by(sub02_table.c.num)
+    image_data_list = await db.fetch_all(image_query)
+    
+    # 3. 파일명 리스트 추출
+    image_filenames = [row['s_pic01'] for row in image_data_list]
+
+    # 4. Dog Pydantic 모델 생성 시 파일명 리스트 추가
+    return Dog(**dog_data, image_filenames=image_filenames)
 
 
 # --- 헬퍼 함수 (Image/Text) ---
@@ -227,43 +248,60 @@ def generate_dog_text(dog: Dog) -> str:
     print("GPT-4o 텍스트 생성 시작...")
     
     try:
-        # 최신 OpenAI 1.x 버전 클라이언트 사용
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        # 🚨 GPT 오류 해결: openai>=1.0.0 버전 클라이언트 사용
+        client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        
         if not client.api_key:
             raise ValueError("OPENAI_API_KEY 환경 변수가 설정되지 않았습니다.")
             
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o-mini", # 비용 및 속도 개선을 위해 mini 모델 사용
             messages=messages,
             temperature=0.7,
             max_tokens=500
         )
         generated_text = response.choices[0].message.content.strip()
         print("GPT-4o 텍스트 생성 완료.")
-        
+            
     except Exception as e:
         print(f"🚨 GPT-4o API 호출 중 오류 발생: {type(e).__name__}: {e}")
         generated_text = "GPT-4o API 오류로 소개글을 생성할 수 없습니다."
-        
+            
     return generated_text
 
 # (이미지 선별 로직 - 5개 파일 중 최적 이미지 선정)
-# 🚨 Task D 반영: 마스크 크기 외 선명도(Focus)를 포함한 종합 점수로 선별 로직 강화
-async def select_best_image(dog: Dog) -> Tuple[Image.Image | None, str | None]:
+# 🚨 Task D 반영 및 개선: 마스크 크기(70%)와 선명도(30%) 가중치 조합 로직 적용
+# 🚨 Task 5 반영: Dog 모델의 image_filenames 속성을 사용하여 파일 목록 가져옴
+async def select_best_image(dog: Dog) -> Tuple[Union[Image.Image, None], Union[str, None]]:
     best_input_image_pil = None
-    best_score = -1 # 🚨 Task D 반영: 마스크 크기 대신 종합 점수 사용
+    best_score = -1 
     original_rgb_image_base64 = None
 
-    image_filenames = [
-        dog.s_pic01, dog.addinfo01, dog.addinfo02, 
-        dog.addinfo12, dog.addinfo15
-    ]
+    # 🚨 Task 5 반영: s_pic01과 sub02에서 가져온 목록을 병합하여 사용
+    image_filenames = []
+    
+    # 1. 대표 사진 s_pic01을 목록에 추가 (최우선)
+    if dog.s_pic01:
+        image_filenames.append(dog.s_pic01)
+        
+    # 2. sub02에서 가져온 갤러리 이미지 파일 목록을 추가
+    image_filenames.extend(dog.image_filenames) # Dog 모델의 image_filenames 속성 사용
+
+    if not image_filenames:
+        print(f"[{dog.uid}] !! 유효한 이미지 파일이 없습니다.")
+        return None, None
     
     remover_session = models.get("remover")
     if not remover_session:
         raise RuntimeError("🚨 rembg 세션이 로드되지 않았습니다.")
 
     print(f"[{dog.uid}] 최적 이미지 선별 시작...")
+    
+    # ⭐️ Task D 개선을 위한 정규화 기준값 (실제 환경에 따라 조정 가능)
+    # 이미지 크기 중요도를 높이기 위해 마스크 크기 기준값 MAX_MASK_SIZE를 사용
+    MAX_MASK_SIZE = 100000 
+    MAX_FOCUS_SCORE = 1000 
+
     for filename in image_filenames:
         if not filename or filename.strip() == "":
             continue
@@ -288,15 +326,20 @@ async def select_best_image(dog: Dog) -> Tuple[Image.Image | None, str | None]:
             alpha_mask = np.array(removed_bg_image.split()[3])
             mask_size = np.count_nonzero(alpha_mask > 10)
             
-            # 3. 종합 점수 계산 (마스크 크기 + 선명도 가중치)
-            # 마스크 크기를 10000으로 나눠 정규화하고, 선명도를 더해 점수를 매깁니다. (선명도에 약간의 가중치 부여)
-            composite_score = (mask_size / 10000) + (focus_measure * 0.1) 
+            # 3. 종합 점수 계산 (마스크 크기(70%) + 선명도(30%) 가중치)
+            
+            # 정규화: 기준값으로 나누어 0~1 사이의 값으로 만듦 (기준값 초과 시 1로 간주)
+            normalized_mask = min(mask_size, MAX_MASK_SIZE) / MAX_MASK_SIZE
+            normalized_focus = min(focus_measure, MAX_FOCUS_SCORE) / MAX_FOCUS_SCORE
+            
+            # ⭐️ 개선된 로직: 크기 70%, 선명도 30% 가중치 적용
+            composite_score = (normalized_mask * 0.7) + (normalized_focus * 0.3)
             
             if composite_score > best_score:
-                print(f"     >>> ★★★ 새 최적 이미지 발견! (점수: {composite_score:.2f}, 마스크: {mask_size}, 선명도: {focus_measure:.2f}, 파일: {filename})")
+                print(f"     >>> ★★★ 새 최적 이미지 발견! (점수: {composite_score:.4f}, 마스크: {mask_size}, 선명도: {focus_measure:.2f}, 파일: {filename})")
                 best_score = composite_score 
                 best_input_image_pil = input_image_pil
-            
+                
                 # 원본 이미지 Base64 저장 로직 (최적 이미지가 바뀔 때마다 업데이트)
                 buffered_original = io.BytesIO()
                 best_input_image_pil.save(buffered_original, format="PNG")

@@ -1,0 +1,26 @@
+FROM nvcr.io/nvidia/tensorrt:23.09-py3
+
+# 1. 시스템 기본 의존성 설치 (RUN 블록을 단일 명령으로 통합)
+RUN rm -rf /etc/apt/sources.list.d/* \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /etc/apt/trusted.gpg.d/* \
+    \
+    # 🚨 GPG 우회 옵션 및 설치 명령을 단일 라인으로 연결 (가장 안정적)
+    && apt-get update -o Acquire::AllowInsecureRepositories=true -o Acquire::AllowDowngradeToInsecureRepositories=true -o Acquire::AllowInvalidAuthentications=true \
+    \
+    && apt-get install -y --no-install-recommends --allow-unauthenticated apt-transport-https git wget \
+    \
+    # 설치 후 최종 정리
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. 파이썬 라이브러리 설치
+COPY requirements.sdxl.txt .
+RUN pip install --no-cache-dir -r requirements.sdxl.txt
+
+# 3. 소스 코드 복사
+COPY sdxl_server.py .
+
+EXPOSE 8001
+
+CMD ["uvicorn", "sdxl_server:app", "--host", "0.0.0.0", "--port", "8001"]

@@ -1,3 +1,11 @@
+import torchvision
+try:
+    # torchvision 0.17+ 버전에서 삭제된 functional_tensor를 functional로 우회 연결
+    import torchvision.transforms.functional_tensor
+except ImportError:
+    import torchvision.transforms.functional as F
+    import sys
+    sys.modules["torchvision.transforms.functional_tensor"] = F
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import os
@@ -13,37 +21,35 @@ import textwrap
 import requests
 from typing import Optional, List, Tuple, Union
 
-# --- DB ---
+# --- [필수] PyTorch 모델 로딩 보안 패치 ---
+_original_load = torch.load
+def _safe_load(*args, **kwargs):
+    if 'weights_only' not in kwargs:
+        kwargs['weights_only'] = False
+    return _original_load(*args, **kwargs)
+torch.load = _safe_load
+# ---------------------------------------
+
 import databases
 import sqlalchemy
-
-# --- AI 모델 ---
-# from diffusers import StableDiffusionXLImg2ImgPipeline # SDXL은 별도 서버로 분리됨
 from rembg import new_session, remove
-from basicsr.archs.rrdbnet_arch import RRDBNet
-from realesrgan import RealESRGANer
+from realesrgan import RealESRGANer 
+from basicsr.archs.rrdbnet_arch import RRDBNet 
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
-
-# GPT-4o 사용
 import openai 
-import httpx # ⭐️ SDXL 서버 통신을 위한 비동기 HTTP 클라이언트 추가
+import httpx 
 
-# --- 1. 환경 변수 및 DB 설정 ---
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 IMAGE_BASE_PATH = os.getenv("IMAGE_BASE_PATH", "/inday_fileinfo/img")
 SITE_BASE_URL = os.getenv("SITE_BASE_URL", "https://www.pimfyvirus.com")
 
-if not DATABASE_URL:
-    raise ValueError("DATABASE_URL 환경 변수가 설정되지 않았습니다.")
-
-database = databases.Database(DATABASE_URL)
+database = databases.Database(DATABASE_URL) if DATABASE_URL else None
 metadata = sqlalchemy.MetaData()
 
-# 'homeprotection' 테이블 정의 (기존 유지)
+# --- DB 테이블 정의 ---
 dogs_table = sqlalchemy.Table(
-    "homeprotection",
-    metadata,
+    "homeprotection", metadata,
     sqlalchemy.Column("uid", sqlalchemy.Integer, primary_key=True),
     sqlalchemy.Column("subject", sqlalchemy.String(250)),
     sqlalchemy.Column("s_pic01", sqlalchemy.String(150)),
@@ -58,27 +64,23 @@ dogs_table = sqlalchemy.Table(
     sqlalchemy.Column("addinfo08", sqlalchemy.Text),
     sqlalchemy.Column("addinfo09", sqlalchemy.Text),
     sqlalchemy.Column("addinfo10", sqlalchemy.Text),
-    sqlalchemy.Column("addinfo11", sqlalchemy.Text),
+    sqlalchemy.Column("addinfo11", sqlalchemy.String(250)),
     sqlalchemy.Column("addinfo19", sqlalchemy.String(250)),
 )
 
-# homeprotectionsub02 테이블 정의 추가
 sub02_table = sqlalchemy.Table(
-    "homeprotectionsub02",
-    metadata,
+    "homeprotectionsub02", metadata,
     sqlalchemy.Column("puid", sqlalchemy.Integer), 
     sqlalchemy.Column("s_pic01", sqlalchemy.String(150)),
     sqlalchemy.Column("num", sqlalchemy.Integer), 
 )
 
-
-# --- 2. Pydantic 모델 정의 (DB 스키마) ---
+# --- 데이터 모델 ---
 class Dog(BaseModel):
     uid: int
     subject: str
     s_pic01: Optional[str] = None
     image_filenames: List[str] = [] 
-    
     addinfo03: Optional[str] = None
     addinfo04: Optional[str] = None
     addinfo05: Optional[str] = None
@@ -92,90 +94,79 @@ class Dog(BaseModel):
 class RealProfileRequest(BaseModel):
     dog_uid: int
 
-
-# --- 3. FastAPI 앱 & AI 모델 변수 선언 ---
+# --- 앱 초기화 ---
 models = {}
 app = FastAPI()
-device = "cuda" if torch.cuda.is_available() else "cpu"
-gpu_id = 0 if device == "cuda" else None
 
-# ⭐️ SDXL 서비스 주소 정의
+# ⭐️ GPU 모드 확인 및 설정
+if torch.cuda.is_available():
+    device = "cuda"
+    gpu_id = 0
+    print(f"🚀 [System] GPU 모드 활성화: {torch.cuda.get_device_name(0)}")
+else:
+    device = "cpu"
+    gpu_id = None
+    print("⚠️ [System] 경고: GPU를 찾을 수 없습니다. CPU로 실행됩니다.")
+
 SDXL_SERVICE_URL = "http://sdxl-service:8001/generate/background"
 
-
-# --- AI 모델 로딩 (서버 시작 시) ---
 @app.on_event("startup")
 def load_models_and_db():
-    print("AI 모델 로딩 시작...")
-    print(f"Using device: {device}")
+    print("🚀 AI 서버 시작: 모델 로딩 중...")
     
-    # ⭐️ SDXL 로딩 코드 제거 - VRAM 확보 완료
-    # print("Loading Stable Diffusion XL pipeline...") ...
-
-    # (모델 2: GPT-4o API 사용)
-    print("KoAlpaca 대신 GPT-4o API를 사용합니다.")
-    
-    # (모델 3: Real-ESRGAN 로드 - 파일 경로 수정)
-    print("Loading Real-ESRGAN model...")
+    # (1) Real-ESRGAN 로드
+    print("Loading Real-ESRGAN PyTorch Model...")
     try:
+        model_arch = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
         model_path = "/app/esrgan/RealESRGAN_x4plus.pth"
-        
-        esrgan_model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
+
         models["upsampler"] = RealESRGANer(
             scale=4,
             model_path=model_path,
-            dni_weight=None,
-            model=esrgan_model,
-            # ⭐️ 성능 최적화: Tile Size 복구 (안정화)
-            tile=4000, 
-            tile_pad=32,
-            pre_pad=16,
-            half=torch.cuda.is_available(),
+            model=model_arch,
+            tile=0,       #️ V100 풀파워
+            tile_pad=10,
+            pre_pad=0,
+            half=True if device == "cuda" else False, 
             gpu_id=gpu_id
         )
-        print("Real-ESRGAN 로드 완료.")
+        print("✅ Real-ESRGAN PyTorch Model loaded successfully.")
     except Exception as e:
-        print(f"🚨 Real-ESRGAN 로드 실패: {e}")
+        print(f"🚨 Real-ESRGAN Load Failed: {e}")
 
-    # (모델 4: rembg 세션 로드)
-    print("Loading rembg session...")
+    # (2) rembg 로드 (BiRefNet 적용)
+    print("Loading rembg session (BiRefNet)...")
     try:
-        models["remover"] = new_session(model_name="u2net_human_seg")
-        print("rembg 세션 로드 완료.")
+        # 털 묘사 업그레이드 모델 (최초 실행 시 다운로드 시간 소요)
+        models["remover"] = new_session(model_name="birefnet-general")
+        print("✅ rembg 세션 로드 완료 (Model: birefnet-general).")
     except Exception as e:
-        print(f"🚨 rembg 세션 로드 실패: {e}.")
+        print(f"🚨 BiRefNet 로드 실패: {e}. 기존 isnet으로 폴백합니다.")
+        models["remover"] = new_session(model_name="isnet-general-use")
 
     print("--- 모든 AI 모델 로딩 완료 ---")
 
-# --- DB 연결/해제 ---
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    if database.is_connected:
+    if database and database.is_connected:
         await database.disconnect()
 
 async def get_db_connection():
-    if not database.is_connected:
+    if database and not database.is_connected:
         await database.connect()
     return database
 
+# --- Helper Functions ---
 async def get_dog_details(dog_uid: int) -> Dog:
     db = await get_db_connection()
-    
+    if not db: raise HTTPException(status_code=500, detail="DB Fail")
     main_query = dogs_table.select().where(dogs_table.c.uid == dog_uid)
     dog_data = await db.fetch_one(main_query)
-    
-    if not dog_data:
-        raise HTTPException(status_code=404, detail=f"UID {dog_uid}에 해당하는 강아지 정보를 DB에서 찾을 수 없습니다.")
-
+    if not dog_data: raise HTTPException(status_code=404, detail="Dog Not Found")
     image_query = sub02_table.select().where(sub02_table.c.puid == dog_uid).order_by(sub02_table.c.num)
     image_data_list = await db.fetch_all(image_query)
-    
     image_filenames = [row['s_pic01'] for row in image_data_list]
-
     return Dog(**dog_data, image_filenames=image_filenames)
-
-
-# --- 헬퍼 함수 (Image/Text) ---
 
 def pil_to_cv2(pil_image):
     return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
@@ -183,331 +174,258 @@ def pil_to_cv2(pil_image):
 def cv2_to_pil(cv2_image):
     return Image.fromarray(cv2.cvtColor(cv2_image, cv2.COLOR_BGR2RGB))
 
+# 텍스트 테두리(Stroke) 그리기 함수 
+def draw_text_with_stroke(draw, x, y, text, font, fill_color, stroke_color, stroke_width):
+    for dx, dy in [(sx, sy) for sx in range(-stroke_width, stroke_width + 1) for sy in range(-stroke_width, stroke_width + 1) if sx * sx + sy * sy <= stroke_width * stroke_width]:
+        draw.text((x + dx, y + dy), text, font=font, fill=stroke_color)
+    draw.text((x, y), text, font=font, fill=fill_color)
 
-# ⭐️ SDXL 서버 통신 함수 추가
+def get_text_width(draw, text, font):
+    max_width = 0
+    if not text: return 0
+    for line in text.split('\n'):
+        try:
+            width = draw.textlength(line, font=font)
+        except:
+            width = len(line) * (font.size * 0.6)
+        if width > max_width: max_width = width
+    return max_width
+
+def remove_emojis(text):
+    if not text: return ""
+    return re.sub(r'[^\w\s,.\-?!@#%&()가-힣/]', '', text).strip()
+
+def extract_contact_info(text):
+    if not text: return "문의: 자세한 내용은 공고 원문 참조"
+    insta_id_match = re.search(r'@[a-zA-Z0-9_.]+', text)
+    if insta_id_match: return f"인스타 {insta_id_match.group()}"
+    insta_url_match = re.search(r'instagram\.com/([a-zA-Z0-9_.]+)', text)
+    if insta_url_match: return f"인스타 @{insta_url_match.group(1)}"
+    url_match = re.search(r'(https?://[^\s]+)', text)
+    if url_match:
+        if "instagram" in url_match.group(0): return "인스타 링크 참조"
+        return "SNS 링크 참조"
+    phone_match = re.search(r'010-?[\d]{3,4}-?[\d]{4}', text)
+    if phone_match: return f"문의 Tel: {phone_match.group()}"
+    return "문의: 자세한 내용은 공고 원문 참조"
+
+#  (Feathering) 함수
+def apply_feathering(pil_img, blur_radius=2):
+    if pil_img.mode != 'RGBA':
+        pil_img = pil_img.convert('RGBA')
+    r, g, b, a = pil_img.split()
+    # 알파 채널에 블러처리 -> 경계 흐릿하게.
+    a_blurred = a.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    return Image.merge("RGBA", (r, g, b, a_blurred))
+
 async def call_sdxl_service(base64_dog_image: str, dog_info: dict) -> Image.Image:
-    """SDXL 서버에 요청하여 배경 이미지를 생성합니다."""
-    
-    # ⭐️ SDXL 배경 설정: 파스텔톤과 프롬프트는 추후 DB 필드로 변경 가능
     color_hint = "pastel pink" 
     prompt_detail = f"Minimalist studio background suitable for {dog_info.get('name', 'a dog')}."
-
-    payload = {
-        "base64_dog_image": base64_dog_image,
-        "prompt": prompt_detail,
-        "color_hint": color_hint
-    }
-
-    print(f"Calling SDXL service at {SDXL_SERVICE_URL} with color: {color_hint}")
+    payload = {"base64_dog_image": base64_dog_image, "prompt": prompt_detail, "color_hint": color_hint}
+    print(f"Calling SDXL service... Hint: {color_hint}")
     
-    # httpx를 사용하여 비동기적으로 호출
     async with httpx.AsyncClient(timeout=100.0) as client:
         try:
             response = await client.post(SDXL_SERVICE_URL, json=payload)
             response.raise_for_status()  
-            
             result = response.json()
             base64_bg = result.get("base64_background_image")
-            
-            if not base64_bg:
-                raise ValueError("SDXL service returned no background image.")
-
-            # Base64 디코딩하여 PIL Image 객체로 반환
-            bg_image_data = base64.b64decode(base64_bg)
-            return Image.open(io.BytesIO(bg_image_data)).convert("RGB")
-
-        except httpx.RequestError as e:
-            print(f"🚨 SDXL Service Connection/Request Error: {e}")
+            if not base64_bg: raise ValueError("No bg image")
+            return Image.open(io.BytesIO(base64.b64decode(base64_bg))).convert("RGB")
         except Exception as e:
-            print(f"🚨 SDXL Processing Error: {e}")
-        
-        # 오류 시 또는 서비스 미사용 시 흰색 배경 반환 (안정성 확보)
-        print("Returning default white background due to SDXL error.")
-        return Image.new('RGB', (800, 1200), (255, 255, 255))
-        
-# (GPT-4o API를 사용하는 텍스트 생성 - 키-값 리스트 형식 강제 적용)
-def generate_dog_text(dog: Dog) -> str:
+            print(f"🚨 SDXL Error: {e}")
+            return Image.new('RGB', (800, 1200), (255, 255, 255))
+
+def generate_dog_text(dog: Dog) -> List[str]: 
     def clean_text(text):
         if not text: return ""
         text = re.sub(r'<[^>]+>', '', text)
-        return text.strip()
+        return remove_emojis(text)
 
-    dog_info = f"""
-    - 이름: {clean_text(dog.subject)}
-    - 성별: {clean_text(dog.addinfo03)}
-    - 나이(추정): {clean_text(dog.addinfo05)}
-    - 몸무게: {clean_text(dog.addinfo07)}kg
-    - 중성화: {clean_text(dog.addinfo04)}
-    - 성격 태그: {clean_text(dog.addinfo08)}
-    - 성격 및 특징: {clean_text(dog.addinfo10)}
-    - 구조 사연: {clean_text(dog.addinfo09)}
-    - 병력/건강: {clean_text(dog.addinfo19)}
-    - 기타: {clean_text(dog.addinfo11)}
-    """
-
-    # 🚨 수정: 출력 형식을 키-값 리스트로 강제
-    system_prompt = """
-    당신은 유기견의 입양 공고에 사용될 **핵심 정보를 키-값(Key-Value) 쌍의 리스트**로 변환하는 AI 전문가입니다.
-    **감정적인 표현은 배제**하고, 요청된 정보를 바탕으로 아래 규칙에 따라 정확하고 간결하게 출력하세요.
-
-    **[생성 규칙]**
-    1. 출력은 오직 **항목: 값** 형태의 리스트로만 구성되어야 합니다. (다른 설명 문장 절대 금지)
-    2. 모든 항목은 줄바꿈 문자(\n)로 분리되어야 합니다.
-    3. 정보가 없는 항목은 출력에서 제외하세요.
-    4. 입양 문의 방법은 마지막 줄에 **반드시** '문의: 인스타그램 @lovely4puppies에서 확인하세요.' 형식으로 추가하세요.
-    """
-
-    user_content = f"""
-    [강아지 정보]:
-    {dog_info}
-
-    위 정보를 기반으로 다음 항목들을 Key-Value 형식으로 변환하여 출력해 주세요.
+    raw_subject = dog.subject if dog.subject else ""
+    if '/' in raw_subject: raw_name = raw_subject.split('/')[0] 
+    else: raw_name = raw_subject 
+    dog_name_only = clean_text(raw_name).strip()
     
-    이름: [이름]
-    성별: [성별]
-    나이: [나이(추정)]
-    몸무게: [몸무게]
-    중성화: [중성화 여부]
+    display_age = dog.addinfo05 if dog.addinfo05 and not dog.addinfo05.isdigit() else f"{dog.addinfo05[:4]}년 {dog.addinfo05[4:]}월생" if dog.addinfo05 and len(dog.addinfo05)==6 else "정보 없음"
     
-    특징: [성격 태그 및 성격/특징 요약]
-    건강 상태: [병력/건강 요약]
-    사연: [구조 사연 요약]
-    """
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_content}
+    basic_info = [
+        f"이름: {dog_name_only}",
+        f"성별: {clean_text(dog.addinfo03)}",
+        f"출생시기: {display_age}", 
+        f"몸무게: {clean_text(dog.addinfo07)}kg",
+        f"중성화: {clean_text(dog.addinfo04)}",
     ]
     
-    print("GPT-4o 텍스트 생성 시작...")
-    
+    story_data = f"이름:{dog_name_only}, 성격:{clean_text(dog.addinfo10)}({clean_text(dog.addinfo08)}), 사연:{clean_text(dog.addinfo09)}"
+    messages = [{"role": "system", "content": "유기견 입양 홍보 문구 2줄 작성. 감성적, 간결하게. 이모티콘 사용 금지."}, {"role": "user", "content": f"정보: {story_data}"}]
     try:
         client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        
-        if not client.api_key:
-            raise ValueError("OPENAI_API_KEY 환경 변수가 설정되지 않았습니다.")
-            
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            temperature=0.7,
-            max_tokens=500
-        )
-        generated_text = response.choices[0].message.content.strip()
-        
-        # 후처리: 문의 항목이 누락될 경우를 대비해 마지막 줄에 명시적으로 추가
-        if not generated_text.lower().strip().endswith("확인하세요."):
-             generated_text += "\n문의: 인스타그램 @lovely4puppies에서 확인하세요."
-             
-        print("GPT-4o 텍스트 생성 완료.")
-            
-    except Exception as e:
-        print(f"🚨 GPT-4o API 호출 중 오류 발생: {type(e).__name__}: {e}")
-        generated_text = "GPT-4o API 오류로 소개글을 생성할 수 없습니다."
-            
-    return generated_text
+        res = client.chat.completions.create(model="gpt-4o-mini", messages=messages, max_tokens=500)
+        generated_story = remove_emojis(res.choices[0].message.content.strip()) 
+    except:
+        generated_story = "따뜻한 가족을 기다립니다."
 
-# (이미지 선별 로직 - A-컷 선별 및 누끼 적합성 최적화 적용)
+    contact_source = ""
+    if dog.addinfo11: contact_source += dog.addinfo11 
+    if dog.addinfo15: contact_source += " " + dog.addinfo15
+    if dog.addinfo12: contact_source += " " + dog.addinfo12
+    final_contact_info = extract_contact_info(contact_source)
+
+    return basic_info + [generated_story, dog_name_only, final_contact_info] 
+
+#  사진 선별 로직 ( 중앙 집중)
 async def select_best_image(dog: Dog) -> Tuple[Union[Image.Image, None], Union[str, None]]:
-    best_input_image_pil = None
-    best_score = -1 
-    original_rgb_image_base64 = None
-
-    image_filenames = []
-    if dog.s_pic01:
-        image_filenames.append(dog.s_pic01)
-    image_filenames.extend(dog.image_filenames)
-
-    if not image_filenames:
-        print(f"[{dog.uid}] !! 유효한 이미지 파일이 없습니다.")
-        return None, None
+    best_img, best_score, best_b64 = None, -999, None
+    imgs = [dog.s_pic01] + dog.image_filenames if dog.s_pic01 else dog.image_filenames
+    imgs = list(dict.fromkeys([x for x in imgs if x and x.strip()])) # 중복 제거
+    if not imgs: return None, None
     
     remover_session = models.get("remover")
-    if not remover_session:
-        raise RuntimeError("🚨 rembg 세션이 로드되지 않았습니다.")
-
-    print(f"[{dog.uid}] 최적 이미지 선별 시작...")
+    print(f"[{dog.uid}] 이미지 정밀 선별 중 ({len(imgs)}장)...")
     
-    MAX_FOCUS_SCORE = 4000 # 기준값 상향 (클로즈업 Focus 점수 희석)
-
-    for filename in image_filenames:
-        if not filename or filename.strip() == "":
-            continue
+    for fname in imgs:
         try:
-            image_url = f"{SITE_BASE_URL}{IMAGE_BASE_PATH}/{filename}"
-            
-            response = requests.get(image_url, stream=True, timeout=5)
-            response.raise_for_status()
-            
-            input_image_pil = Image.open(response.raw).convert("RGB")
-            
-            # 1. 선명도(Focus) 측정
-            cv2_gray = cv2.cvtColor(pil_to_cv2(input_image_pil), cv2.COLOR_BGR2GRAY)
-            focus_measure = cv2.Laplacian(cv2_gray, cv2.CV_64F).var()
-            
-            # 2. rembg를 사용하여 마스크 크기 측정 (강아지 크기)
-            removed_bg_image = remove(
-                input_image_pil, 
-                session=remover_session, 
-                alpha_matting=True 
-            )
-            alpha_mask = np.array(removed_bg_image.split()[3])
-            mask_size = np.count_nonzero(alpha_mask > 10)
-            
-            # 3. 종합 점수 계산 (누끼 적합성 최우선)
-            
-            # ⭐️ 이미지 선별 최적화: 마스크 크기 정규화 기준을 동적으로 설정 (전체 픽셀의 20%를 최적으로)
-            width, height = input_image_pil.size
-            aspect_ratio = max(width, height) / min(width, height)
-            
-            # 구도 보너스: 세로(portrait) 구도일 때 (+0.2 보너스)
-            orientation_bonus = 0.0
-            if aspect_ratio < 1.1 or (height > width and aspect_ratio < 1.5):
-                orientation_bonus = 0.2 
-            
-            # 3. 종합 점수 계산 (누끼 적합성 및 구도 100% 반영)
-            TARGET_MASK_SIZE = (width * height) * 0.20 # 강아지가 화면의 20% 차지할 때 최대 점수
-            
-            # ⭐️ Mask Size 초과 시 패널티 적용
-            if mask_size > TARGET_MASK_SIZE:
-                # 20% 초과 시 초과 점수 획득을 막고 1.0으로 고정 (클로즈업 사진 방지)
-                normalized_mask = 1.0
-            else:
-                # 20% 이하일 때는 비율대로 점수를 부여
-                normalized_mask = mask_size / TARGET_MASK_SIZE
-            
-            normalized_focus = min(focus_measure, MAX_FOCUS_SCORE) / MAX_FOCUS_SCORE
-            
-            # ⭐️ 최종 가중치: Mask Ratio 100% + 구도 보너스 (Focus Score 기여도 0)
-            composite_score = (normalized_mask * 1.0) + orientation_bonus + (normalized_focus * 0.0)
-            
-            if composite_score > best_score:
-                print(f"     >>> ★★★ 새 최적 이미지 발견! (점수: {composite_score:.4f}, 마스크: {mask_size}, 선명도: {focus_measure:.2f}, 파일: {filename})")
-                best_score = composite_score 
-                best_input_image_pil = input_image_pil
-                
-                buffered_original = io.BytesIO()
-                best_input_image_pil.save(buffered_original, format="PNG")
-                original_rgb_image_base64 = base64.b64encode(buffered_original.getvalue()).decode("utf-8")
-                
-        except requests.exceptions.HTTPError as e:
-            print(f"     ! 이미지 처리 중 오류 (HTTP 오류 - 404 등): {image_url} / 오류: {e}")
-            continue
-        except Exception as e:
-            print(f"     ! 이미지 처리 중 오류 (PIL/기타 오류 - 파일 식별 실패 등): {image_url} / 오류: {e}")
-            continue
-            
-    return best_input_image_pil, original_rgb_image_base64
+            url = f"{SITE_BASE_URL}{IMAGE_BASE_PATH}/{fname}"
+            res = requests.get(url, stream=True, timeout=5)
+            res.raise_for_status()
+            img = Image.open(res.raw).convert("RGB")
+            w, h = img.size
 
+            # 속도를 위해 리사이징 & Alpha Matting OFF
+            img_small = img.resize((300, int(300*h/w)))
+            no_bg_small = remove(img_small, session=remover_session, alpha_matting=False)
+            
+            alpha = np.array(no_bg_small.split()[3])
+            if cv2.countNonZero(alpha) == 0: continue
 
-# --- API 엔드포인트 ---
+            coords = cv2.findNonZero(alpha)
+            x, y, box_w, box_h = cv2.boundingRect(coords)
+            
+            mask_area = box_w * box_h
+            total_area = img_small.width * img_small.height
+            mask_ratio = mask_area / total_area
+            
+            score = 0
+            
+            # 1. 크기 점수 (꽉 찬 사진 우대, 10% 미만 탈락)
+            if mask_ratio < 0.10: score = -10.0
+            else: score += min(mask_ratio * 5.0, 5.0) # 클수록 점수 (최대 5점)
 
+            # 2. 중앙 집중도 점수
+            center_x = x + box_w / 2
+            center_y = y + box_h / 2
+            img_center_x = img_small.width / 2
+            img_center_y = img_small.height / 2
+            dist_norm = ((center_x - img_center_x)**2 + (center_y - img_center_y)**2)**0.5
+            max_dist = (img_small.width**2 + img_small.height**2)**0.5
+            score += (1 - (dist_norm / max_dist)) * 3.0
+
+            # 3. 세로 사진 우대
+            if h > w: score += 2.0
+
+            # 4. 하단 잘림 체크 (다리/발 잘린 사진 감점)
+            if (y + box_h) > (img_small.height * 0.98): score -= 2.0 
+
+            if score > best_score:
+                best_score = score
+                best_img = img
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                best_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        except: continue
+    return best_img, best_b64
+
+# --- 메인 API ---
 @app.post("/api/v1/generate-real-profile", response_model=dict)
 async def generate_real_profile(request: RealProfileRequest):
-    if "upsampler" not in models or "remover" not in models:
-        raise HTTPException(status_code=503, detail="AI 모델(Upsampler/Remover)이 로드되지 않았습니다.")
-
+    if "upsampler" not in models: raise HTTPException(status_code=503, detail="Model Loading")
     dog = await get_dog_details(request.dog_uid)
-    
-    # 1. 최적의 이미지 선별
-    best_input_image_pil, original_rgb_image_base64 = await select_best_image(dog)
-    
-    final_image_base64 = ""
-    generated_text = ""
+    best_img, orig_b64 = await select_best_image(dog)
+    if not best_img: return {"profile_text": "이미지 없음", "profile_image_base64": ""}
 
     try:
-        if best_input_image_pil:
-            # 2. Real-ESRGAN으로 화질 복원 
-            cv2_image = pil_to_cv2(best_input_image_pil)
-            upscaled_image_cv2, _ = models["upsampler"].enhance(cv2_image, outscale=4)
-            upscaled_image_pil = cv2_to_pil(upscaled_image_cv2)
-            print("화질 복원 완료.")
+        # 1. Upscaling
+        cv2_img = pil_to_cv2(best_img)
+        output, _ = models["upsampler"].enhance(cv2_img, outscale=4)
+        upscaled_pil = cv2_to_pil(output)
+        print("✅ 화질 복원 완료")
 
-            # 3. 복원된 이미지의 배경 제거 (rembg)
-            print("배경 제거(rembg) 시작...")
-            remover_session = models.get("remover") 
-            removed_bg_image = remove(
-                upscaled_image_pil,
-                session=remover_session,
-                alpha_matting=True
-            )
-            print("배경 제거 완료.")
-
-            # ⭐️ 4. SDXL 서버 호출 및 배경 이미지 받기 (마이크로서비스 연동)
-            dog_info_dict = {"name": dog.subject}
-            
-            # 누끼 딴 이미지를 Base64 (PNG)로 인코딩
-            temp_buffer = io.BytesIO()
-            removed_bg_image.save(temp_buffer, format="PNG") 
-            base64_dog_image_png = base64.b64encode(temp_buffer.getvalue()).decode("utf-8")
-
-            # SDXL 서버 호출
-            sdxl_bg_image_pil = await call_sdxl_service(base64_dog_image_png, dog_info_dict)
-            
-            # 5. 텍스트 생성 (GPT-4o)
-            generated_text = generate_dog_text(dog)
-            
-            # 6. Pillow 템플릿 합성 (SDXL 배경 사용)
-            print("Pillow 템플릿 합성 시작...")
-            template_width = 800
-            template_height = 1200
-            
-            # ⭐️ SDXL 배경 이미지를 템플릿으로 사용
-            template = sdxl_bg_image_pil.resize((template_width, template_height))
-            # draw는 RGB 이미지에만 사용 가능하므로, 배경 이미지에서 draw 객체 생성
-            draw = ImageDraw.Draw(template) 
-
-            try:
-                font_title = ImageFont.truetype("/app/NanumGothic-Bold.ttf", 40)
-                font_body = ImageFont.truetype("/app/NanumGothic-Regular.ttf", 24)
-            except IOError:
-                font_title = ImageFont.load_default()
-                font_body = ImageFont.load_default()
-                print("!! 폰트 파일 로드 실패. 기본 폰트 사용.")
-
-
-            img_height = int(template_width * (removed_bg_image.height / removed_bg_image.width))
-            
-            # ⭐️ 배경 위에 누끼 딴 강아지 이미지(RGBA) 합성
-            image_to_template = removed_bg_image.resize((template_width, img_height))
-            template.paste(image_to_template, (0, 0), image_to_template) 
-
-            # 텍스트 출력
-            text_y_position = img_height + 30
-            draw.text((30, text_y_position), dog.subject, font=font_title, fill=(0,0,0))
-            text_y_position += 60
-
-            lines = generated_text.split('\n')
-            for line in lines:
-                draw.text((30, text_y_position), line.strip(), font=font_body, fill=(50, 50, 50))
-                text_y_position += 30
-
-            buffered = io.BytesIO()
-            template.save(buffered, format="PNG")
-            final_image_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
-            print("Pillow 템플릿 합성 완료.")
-
-        else:
-            print(f"[{dog.uid}] !! 치명적 오류: 유효한 이미지가 없어 프로필 생성을 중단합니다.")
-            generated_text = "프로필을 생성할 수 없습니다: 유효한 원본 이미지가 없습니다."
-            final_image_base64 = ""
-            
-    except Exception as e:
-        print(f"[{dog.uid}] !! 이미지/텍스트 처리 중 오류: {e}. 원본 이미지를 반환합니다.")
-        final_image_base64 = original_rgb_image_base64 or "Error: Template composition failed."
-        generated_text = generated_text or "프로필 생성 중 오류가 발생했습니다."
-    
-    # ⭐️ 성능 최적화 3: 요청 종료 후 GPU 메모리 정리
-    finally:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        import gc; gc.collect()
+        # 2. Background Removal (BiRefNet + Feathering)
+        # ⭐️ alpha_matting=False (속도) / Feathering (부드러움)
+        no_bg = remove(upscaled_pil, session=models["remover"], alpha_matting=False)
+        no_bg = apply_feathering(no_bg, blur_radius=2)
+        print("✅ 배경 제거 및 페더링 완료")
         
-    return {
-        "profile_text": generated_text,
-        "profile_image_base64": final_image_base64
-    }
+        # 3. SDXL Background
+        buf = io.BytesIO()
+        no_bg.save(buf, format="PNG")
+        b64_png = base64.b64encode(buf.getvalue()).decode("utf-8")
+        bg_img = await call_sdxl_service(b64_png, {"name": dog.subject})
+        
+        # 4. Template Generation
+        text_result = generate_dog_text(dog)
+        texts = text_result[0:5] 
+        story = text_result[5]
+        dog_name_only = text_result[6] 
+        contact_info = text_result[7]
 
-@app.get("/api/dogs/{dog_uid}", response_model=Dog)
-async def get_dog_details_api(dog_uid: int):
-    return await get_dog_details(dog_uid)
+        template_w, template_h = 1080, 1350
+        template = bg_img.resize((template_w, template_h))
+        draw = ImageDraw.Draw(template)
+        
+        try:
+            ft = ImageFont.truetype("/app/KyoboHandwriting2021sjy.otf", 80)
+            fb = ImageFont.truetype("/app/KyoboHandwriting2021sjy.otf", 38)
+            fc = ImageFont.truetype("/app/KyoboHandwriting2021sjy.otf", 30) 
+        except: ft = fb = fc = ImageFont.load_default()
+
+        t_txt = f"{dog_name_only}의 가족을 찾습니다."
+        tw = get_text_width(draw, t_txt, ft)
+        draw_text_with_stroke(draw, (template_w-tw)/2, 60, t_txt, ft, (255,255,255), (0,0,0), 3)
+        
+        orig_w, orig_h = no_bg.size
+        disp_w = template_w
+        disp_h = int(orig_h * (disp_w / orig_w))
+        
+        MAX_IMG_H = 600
+        if disp_h > MAX_IMG_H:
+            disp_h = MAX_IMG_H
+            disp_w = int(orig_w * (disp_h / orig_h))
+        
+        paste_img = no_bg.resize((disp_w, disp_h))
+        template.paste(paste_img, ((template_w-disp_w)//2, 180), paste_img)
+        
+        cy = 180 + disp_h + 60
+        for i, line in enumerate(texts): 
+            w = get_text_width(draw, line, fb)
+            draw.text(((template_w-w)/2, cy), line, font=fb, fill=(50,50,50))
+            cy += 50 
+        
+        cy += 30
+        for line in textwrap.wrap(story, width=40):
+            w = get_text_width(draw, line, fb)
+            draw.text(((template_w-w)/2, cy), line, font=fb, fill=(0,0,0))
+            cy += 50
+            
+        # ️ SNS/연락처 정보 출력 (테두리 추가)
+        cw = get_text_width(draw, contact_info, fc)
+        draw_text_with_stroke(
+            draw, 
+            (template_w-cw)/2, 
+            template_h - 80, 
+            contact_info, 
+            fc, 
+            (100, 100, 100), # 내부 글씨 색 (진한 회색)
+            (255, 255, 255), # 테두리 색 (흰색)
+            2
+        )
+
+        buf = io.BytesIO()
+        template.save(buf, format="PNG")
+        final_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        return {"profile_text": '\n'.join(texts), "profile_image_base64": final_b64}
+        
+    except Exception as e:
+        print(f"🚨 Processing Error: {e}")
+        return {"profile_text": "Error", "profile_image_base64": orig_b64}

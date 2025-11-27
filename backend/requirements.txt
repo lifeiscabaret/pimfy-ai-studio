@@ -1,6 +1,6 @@
 opencv-python-headless
 accelerate
-httpx
+httpx==0.27.2
 databases
 diffusers>=0.27.0
 fastapi
@@ -16,7 +16,8 @@ torch>=2.0.0
 torchvision>=0.17.0
 transformers
 uvicorn
-openai==1.35.0
+# ⭐️ OpenAI 버전을 올려서 httpx 충돌 해결
+openai==1.55.0
 git+https://github.com/xinntao/Real-ESRGAN.git
 aiomysql
 pycuda

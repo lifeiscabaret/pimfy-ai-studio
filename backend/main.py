@@ -7,7 +7,9 @@ except ImportError:
     sys.modules["torchvision.transforms.functional_tensor"] = F
 # ---------------------------------------
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, File, UploadFile, Form
+# 👇 CORS 미들웨어 임포트
+from fastapi.middleware.cors import CORSMiddleware 
 from pydantic import BaseModel
 import os
 from dotenv import load_dotenv
@@ -21,7 +23,15 @@ import re
 import textwrap
 import requests
 from typing import Optional, List, Tuple, Union, Dict
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageColor
+
+# ⭐️ HEIC 포맷 지원
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+    print("✅ HEIC Image Support Enabled.")
+except ImportError:
+    print("⚠️ pillow-heif not found. HEIC images might cause errors.")
 
 import databases
 import sqlalchemy
@@ -94,6 +104,15 @@ class RealProfileRequest(BaseModel):
 models = {}
 app = FastAPI()
 
+# ⭐️ [필수] CORS 설정 추가 (여기!)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 모든 주소 허용 (로컬 테스트용)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 if torch.cuda.is_available():
     device = "cuda"
     gpu_id = 0
@@ -122,8 +141,8 @@ def load_models_and_db():
     except Exception as e:
         print(f"🚨 Real-ESRGAN Failed: {e}")
 
-    # 2. Rembg (선별용)
-    print("Loading Rembg for Selection...")
+    # 2. Rembg
+    print("Loading Rembg...")
     try:
         models["remover"] = new_session(model_name="isnet-general-use")
         print("✅ Rembg Loaded.")
@@ -141,6 +160,40 @@ async def get_db_connection():
     return database
 
 # --- Helper Functions ---
+def resize_image_if_too_large(img: Image.Image, max_dim: int = 1024) -> Image.Image:
+    w, h = img.size
+    if max(w, h) > max_dim:
+        scale = max_dim / max(w, h)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        return img.resize((new_w, new_h), Image.LANCZOS)
+    return img
+
+# ⭐️ [핵심 수정] "정사각형 캔버스"에 이미지를 "가운데 정렬"하는 함수
+# 이렇게 하면 겉모양은 무조건 정사각형(깔끔함)이 되고, 사진은 안 잘립니다.
+def create_framed_image(pil_img: Image.Image) -> Image.Image:
+    w, h = pil_img.size
+    
+    # 1. 정사각형 캔버스 크기 결정 (사진의 가장 긴 변 기준)
+    # 조금 넉넉하게 잡아서 해상도 유지
+    canvas_size = max(w, h)
+    
+    # 2. 흰색 정사각형 캔버스 생성
+    square_canvas = Image.new('RGB', (canvas_size, canvas_size), 'white')
+    
+    # 3. 중앙 좌표 계산
+    offset_x = (canvas_size - w) // 2
+    offset_y = (canvas_size - h) // 2
+    
+    # 4. 사진 붙이기 (잘림 없음!)
+    square_canvas.paste(pil_img, (offset_x, offset_y))
+    
+    # 5. 테두리 추가 (캔버스 크기의 3% 정도만) - 폴라로이드 느낌 살짝
+    border_size = int(canvas_size * 0.03)
+    framed_img = ImageOps.expand(square_canvas, border=border_size, fill='white')
+    
+    return framed_img
+
 async def get_dog_details(dog_uid: int) -> Dog:
     db = await get_db_connection()
     if not db: raise HTTPException(status_code=500, detail="DB Fail")
@@ -176,7 +229,6 @@ async def call_sdxl_service(base64_dog_image: str, dog_info: dict) -> Image.Imag
     prompt_detail = "A minimalist aesthetic background, warm sunlight shadows on a white wall, clean interior, cozy atmosphere, high quality, soft focus, instagram vibe."
 
     payload = {"base64_dog_image": base64_dog_image, "prompt": prompt_detail, "color_hint": color_hint}
-    print(f"Calling SDXL... Hint: {color_hint}")
     
     async with httpx.AsyncClient(timeout=100.0) as client:
         try:
@@ -187,7 +239,6 @@ async def call_sdxl_service(base64_dog_image: str, dog_info: dict) -> Image.Imag
             if not base64_bg: raise ValueError("No bg image")
             return Image.open(io.BytesIO(base64.b64decode(base64_bg))).convert("RGB")
         except Exception as e:
-            print(f"🚨 SDXL Error: {e}")
             return Image.new('RGB', (1080, 1350), (250, 245, 240)) 
 
 def generate_dog_text(dog: Dog) -> Dict: 
@@ -208,19 +259,12 @@ def generate_dog_text(dog: Dog) -> Dict:
         f"중성화: {clean_text(dog.addinfo04)}",
     ]
     
-    # 연락처 정보 제외
     info_source = [dog.addinfo08, dog.addinfo09, dog.addinfo10, dog.addinfo01]
     story_data = f"이름:{dog_name_only}, " + " ".join([clean_text(x) for x in info_source if x])
     
-    # ⭐️ [수정됨] 1인칭 존댓말 & 감성 말투 강제 프롬프트
     system_prompt = """
     당신은 입양을 기다리는 유기견입니다. 미래의 가족에게 보내는 짧은 편지를 작성하세요.
-    다음 규칙을 반드시 지키세요:
-    1. 시점: 무조건 '저', '제'를 사용한 1인칭 시점. (예: "저는 밤이에요!")
-    2. 말투: 예의 바르고 다정하며 사랑스러운 '존댓말(해요체)'을 사용하세요.
-    3. 금지사항: '이 친구는', '소담이는' 처럼 제3자가 설명하는 말투 절대 금지. '남성분들은~' 같은 복잡한 조건이나 부정적인 내용 금지.
-    4. 내용: 강아지의 성격과 매력을 어필하고, 가족을 만나고 싶다는 소망을 2~3문장으로 표현하세요.
-    5. 예시: "안녕하세요, 전 밤이라고 해요! 전 산책을 좋아하고 사람 품을 너무 좋아해요. 평생 가족과 함께 행복하게 사는 게 제 꿈이에요!"
+    규칙: 1인칭('저', '제'), 다정한 존댓말(해요체). 2~3문장.
     """
     
     messages = [
@@ -234,7 +278,6 @@ def generate_dog_text(dog: Dog) -> Dict:
         res = client.chat.completions.create(model="gpt-4o-mini", messages=messages, max_tokens=300)
         generated_story = remove_emojis(res.choices[0].message.content.strip())
     except Exception as e:
-        print(f"🚨 OpenAI Error: {e}")
         generated_story = f"안녕하세요, 저는 {dog_name_only}예요! 저의 평생 가족이 되어주실 분을 기다리고 있어요."
 
     return {
@@ -243,7 +286,6 @@ def generate_dog_text(dog: Dog) -> Dict:
         "name": dog_name_only
     }
 
-# ⭐️ 사진 선별 로직 (회전 보정 추가)
 async def select_best_image(dog: Dog) -> Union[Image.Image, None]:
     best_img, best_score = None, -9999
     imgs = list(dict.fromkeys([x for x in ([dog.s_pic01] + dog.image_filenames) if x and x.strip()]))
@@ -260,19 +302,15 @@ async def select_best_image(dog: Dog) -> Union[Image.Image, None]:
             res = requests.get(url, stream=True, timeout=5)
             res.raise_for_status()
             img = Image.open(res.raw).convert("RGB")
-            
-            # ⭐️ [추가됨] EXIF 정보에 따라 이미지 회전 보정 (두부 사진 눕는 현상 해결)
             img = ImageOps.exif_transpose(img)
             
             w, h = img.size
             if w < 250 or h < 250: continue 
 
-            # 평가용 리사이징
             small_w = 320
             small_h = int(h * (small_w / w))
             img_small = img.resize((small_w, small_h))
             
-            # rembg 실행
             no_bg = remove(img_small, session=remover, alpha_matting=False)
             
             alpha = np.array(no_bg.split()[3])
@@ -281,7 +319,6 @@ async def select_best_image(dog: Dog) -> Union[Image.Image, None]:
             coords = cv2.findNonZero(alpha)
             x, y, box_w, box_h = cv2.boundingRect(coords)
             
-            # 점수 산정
             mask_area = box_w * box_h
             total_area = small_w * small_h
             score_size = (mask_area / total_area) * 100 
@@ -315,43 +352,31 @@ async def select_best_image(dog: Dog) -> Union[Image.Image, None]:
             
     return best_img
 
-# --- 메인 API ---
+# =========================================================
+# 1. 자동 프로필 생성 (핌피바이러스 공고)
+# =========================================================
 @app.post("/api/v1/generate-real-profile", response_model=dict)
 async def generate_real_profile(request: RealProfileRequest):
     if "upsampler" not in models: raise HTTPException(status_code=503, detail="Model Loading")
-    dog = await get_dog_details(request.dog_uid)
-    
-    best_img = await select_best_image(dog)
-    if not best_img: return {"profile_text": "이미지 없음", "profile_image_base64": ""}
-    
-    # 원본 보존
-    buf_orig = io.BytesIO()
-    best_img.save(buf_orig, format="JPEG")
-    orig_b64 = base64.b64encode(buf_orig.getvalue()).decode("utf-8")
-
     try:
-        # 1. 화질 개선
+        dog = await get_dog_details(request.dog_uid)
+        best_img = await select_best_image(dog)
+        if not best_img: return {"profile_text": "이미지 없음", "profile_image_base64": ""}
+        
+        best_img = resize_image_if_too_large(best_img)
+
         cv2_img = pil_to_cv2(best_img)
         output, _ = models["upsampler"].enhance(cv2_img, outscale=4)
         upscaled_pil = cv2_to_pil(output)
-        print("✅ 화질 복원 완료")
 
-        # 2. 액자 스타일
-        w, h = upscaled_pil.size
-        min_dim = min(w, h)
-        left, top = (w - min_dim)/2, (h - min_dim)/2
-        crop_img = upscaled_pil.crop((left, top, left + min_dim, top + min_dim))
+        # ⭐️ [적용] 정사각형 액자에 이미지 중앙 배치 (Fit)
+        processed_img = create_framed_image(upscaled_pil)
         
-        border_size = int(min_dim * 0.05)
-        processed_img = ImageOps.expand(crop_img, border=border_size, fill='white')
-        
-        # 3. 배경 생성
         buf = io.BytesIO()
         processed_img.save(buf, format="PNG") 
         b64_png = base64.b64encode(buf.getvalue()).decode("utf-8")
         bg_img = await call_sdxl_service(b64_png, {"name": dog.subject})
         
-        # 4. 텍스트 및 레이아웃
         text_data = generate_dog_text(dog)
         
         template_w, template_h = 1080, 1350
@@ -364,7 +389,6 @@ async def generate_real_profile(request: RealProfileRequest):
         except: 
             ft = fb = ImageFont.load_default()
 
-        # 타이틀
         t_txt = f"{text_data['name']}의 가족을 찾습니다."
         tw = get_text_width(draw, t_txt, ft)
         draw_text_with_stroke(draw, (template_w-tw)/2, 60, t_txt, ft, (255,255,255), (0,0,0), 3)
@@ -378,6 +402,7 @@ async def generate_real_profile(request: RealProfileRequest):
         available_h = template_h - header_height - text_total_height - footer_margin
         
         p_w, p_h = processed_img.size
+        # 가로 900으로 고정 (정사각형이므로 세로도 900이 됨)
         target_w = 900
         target_h = int(p_h * (target_w / p_w))
         
@@ -394,11 +419,12 @@ async def generate_real_profile(request: RealProfileRequest):
             draw_text_with_stroke(draw, (template_w-w)/2, cy, line, fb, (50,50,50), (255,255,255), 2)
             cy += line_height
         
-        # 5. JPEG 저장
         buf = io.BytesIO()
         template = template.convert("RGB")
         template.save(buf, format="JPEG", quality=90, optimize=True)
         final_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        
+        torch.cuda.empty_cache()
         
         return {
             "profile_text": '\n'.join(text_data['basic_info'] + [text_data['story']]), 
@@ -406,5 +432,200 @@ async def generate_real_profile(request: RealProfileRequest):
         }
         
     except Exception as e:
-        print(f"🚨 Processing Error: {e}")
-        return {"profile_text": "Error", "profile_image_base64": orig_b64}
+        print(f"🚨 Auto Profile Error: {e}")
+        return {"profile_text": "Error", "profile_image_base64": ""}
+
+# =========================================================
+# 2. 입양/임보 프로필 (수동 입력)
+# =========================================================
+@app.post("/api/v1/generate-adoption-profile", response_model=dict)
+async def generate_adoption_profile(
+    image: UploadFile = File(...),
+    name: str = Form(...),
+    age: str = Form(...),
+    personality: str = Form(...),
+    features: str = Form(...)
+):
+    if "upsampler" not in models: raise HTTPException(status_code=503, detail="Model Loading")
+
+    try:
+        contents = await image.read()
+        if len(contents) == 0: raise ValueError("Uploaded file is empty.")
+
+        img = Image.open(io.BytesIO(contents)).convert("RGB")
+        img = ImageOps.exif_transpose(img) 
+        img = resize_image_if_too_large(img)
+
+        cv2_img = pil_to_cv2(img)
+        output, _ = models["upsampler"].enhance(cv2_img, outscale=4)
+        upscaled_pil = cv2_to_pil(output)
+
+        # ⭐️ [적용] 정사각형 액자에 이미지 중앙 배치 (Fit)
+        processed_img = create_framed_image(upscaled_pil)
+        
+        buf = io.BytesIO()
+        processed_img.save(buf, format="PNG")
+        b64_png = base64.b64encode(buf.getvalue()).decode("utf-8")
+        bg_img = await call_sdxl_service(b64_png, {"name": name})
+
+        # 프롬프트: 성격/특징을 녹여내도록 요청
+        story_data = f"이름:{name}, 나이:{age}, 성격:{personality}, 특징:{features}"
+        system_prompt = """
+        당신은 입양을 기다리는 강아지입니다. 미래의 가족에게 보내는 편지를 작성하세요.
+        규칙:
+        1. 제공된 성격과 특징을 **모두 자연스럽게 녹여서** 하나의 이야기로 만드세요.
+        2. 시점은 '저', '제'를 사용한 1인칭 시점입니다.
+        3. 말투는 사랑스럽고 다정한 '해요체' 존댓말을 사용하세요.
+        4. 길이는 2~3문장으로 제한합니다.
+        """
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"내 정보: {story_data}"}
+        ]
+        
+        try:
+            client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            res = client.chat.completions.create(model="gpt-4o-mini", messages=messages, max_tokens=300)
+            generated_story = remove_emojis(res.choices[0].message.content.strip())
+        except:
+            generated_story = f"안녕하세요! 저는 {name}이에요. 사랑 넘치는 가족을 기다리고 있어요!"
+
+        template_w, template_h = 1080, 1350
+        template = bg_img.resize((template_w, template_h))
+        draw = ImageDraw.Draw(template)
+        
+        try:
+            ft = ImageFont.truetype("/app/KyoboHandwriting2021sjy.otf", 80)
+            fb = ImageFont.truetype("/app/KyoboHandwriting2021sjy.otf", 38)
+        except: ft = fb = ImageFont.load_default()
+
+        t_txt = f"{name}의 가족을 찾습니다."
+        tw = get_text_width(draw, t_txt, ft)
+        draw_text_with_stroke(draw, (template_w-tw)/2, 60, t_txt, ft, (255,255,255), (0,0,0), 3)
+        
+        # ⭐️ [핵심 수정] 성격/특징 날것 출력 삭제! 이름/나이만 출력
+        info_lines = [f"이름: {name}", f"나이: {age}"]
+        
+        # AI 스토리만 붙임
+        lines = info_lines + textwrap.wrap(generated_story, width=35)
+        
+        header_height = 180
+        line_height = 50
+        text_total_height = (len(lines) * line_height) + 50
+        footer_margin = 100
+        
+        available_h = template_h - header_height - text_total_height - footer_margin
+        p_w, p_h = processed_img.size
+        
+        # 가로 900 고정 (정사각형이므로)
+        target_w = 900
+        target_h = int(p_h * (target_w / p_w))
+        
+        if target_h > available_h:
+            target_h = available_h
+            target_w = int(p_w * (target_h / p_h))
+
+        paste_img = processed_img.resize((target_w, target_h))
+        template.paste(paste_img, ((template_w-target_w)//2, header_height))
+        
+        cy = header_height + target_h + 40
+        for line in lines:
+            w = get_text_width(draw, line, fb)
+            draw_text_with_stroke(draw, (template_w-w)/2, cy, line, fb, (50,50,50), (255,255,255), 2)
+            cy += line_height
+
+        buf = io.BytesIO()
+        template = template.convert("RGB")
+        template.save(buf, format="JPEG", quality=90, optimize=True)
+        final_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        
+        torch.cuda.empty_cache()
+
+        # 반환값도 정리
+        return {"profile_text": '\n'.join(info_lines + [generated_story]), "profile_image_base64": final_b64}
+
+    except Exception as e:
+        print(f"🚨 Adoption Profile Error: {e}")
+        raise HTTPException(status_code=422, detail="Unsupported Image Format or Corrupt File.")
+
+# =========================================================
+# 3. 스튜디오 프로필 (누끼 + 중앙 정렬 + HEIC 지원)
+# =========================================================
+@app.post("/api/v1/generate-studio-profile", response_model=dict)
+async def generate_studio_profile(
+    image: UploadFile = File(...),
+    bg_color: str = Form("#FFD1DC") 
+):
+    if "upsampler" not in models or "remover" not in models: 
+        raise HTTPException(status_code=503, detail="Model Loading")
+
+    try:
+        contents = await image.read()
+        if len(contents) == 0: raise ValueError("Uploaded file is empty.")
+
+        img = Image.open(io.BytesIO(contents)).convert("RGB")
+        img = ImageOps.exif_transpose(img)
+        
+        w, h = img.size
+        
+        TARGET_SIZE = 1280
+        if max(w, h) > TARGET_SIZE:
+            scale = TARGET_SIZE / max(w, h)
+            new_w, new_h = int(w * scale), int(h * scale)
+            img = img.resize((new_w, new_h), Image.LANCZOS)
+        
+        if max(w, h) < 1000:
+            cv2_img = pil_to_cv2(img)
+            output, _ = models["upsampler"].enhance(cv2_img, outscale=4)
+            img = cv2_to_pil(output)
+            img = resize_image_if_too_large(img, max_dim=1500)
+
+        no_bg = remove(
+            img, 
+            session=models["remover"], 
+            alpha_matting=True,
+            alpha_matting_foreground_threshold=240,
+            alpha_matting_background_threshold=10,
+            alpha_matting_erode_size=10
+        )
+
+        bbox = no_bg.getbbox() 
+        if bbox:
+            subject_only = no_bg.crop(bbox) 
+        else:
+            subject_only = no_bg 
+
+        TARGET_W, TARGET_H = 1080, 1350
+        try:
+            color_rgb = ImageColor.getrgb(bg_color)
+        except:
+            color_rgb = (255, 240, 245)
+        final_canvas = Image.new("RGB", (TARGET_W, TARGET_H), color_rgb)
+
+        MAX_SUB_W = int(TARGET_W * 0.9)
+        MAX_SUB_H = int(TARGET_H * 0.9)
+
+        s_w, s_h = subject_only.size
+        scale_w = MAX_SUB_W / s_w
+        scale_h = MAX_SUB_H / s_h
+        scale_factor = min(scale_w, scale_h) 
+
+        new_s_w = int(s_w * scale_factor)
+        new_s_h = int(s_h * scale_factor)
+        resized_subject = subject_only.resize((new_s_w, new_s_h), Image.LANCZOS)
+
+        paste_x = (TARGET_W - new_s_w) // 2
+        paste_y = (TARGET_H - new_s_h) // 2
+        final_canvas.paste(resized_subject, (paste_x, paste_y), resized_subject)
+
+        buf = io.BytesIO()
+        final_canvas.save(buf, format="JPEG", quality=90, optimize=True)
+        final_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        
+        torch.cuda.empty_cache()
+
+        return {"profile_image_base64": final_b64, "message": "성공"}
+
+    except Exception as e:
+        print(f"🚨 Studio Profile Error: {e}")
+        return {"profile_image_base64": "", "message": "Error"}

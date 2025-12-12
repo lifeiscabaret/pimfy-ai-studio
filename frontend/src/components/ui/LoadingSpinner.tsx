@@ -6,7 +6,7 @@ interface LoadingSpinnerProps {
 }
 
 const PawSVG = (props: { className?: string }) => (
-    <svg className={props.className} width="80" height="80" viewBox="0 0 303 260" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <svg className={props.className} viewBox="0 0 303 260" fill="none" xmlns="http://www.w3.org/2000/svg">
         <g filter="url(#filter0_d_71_23)">
             <ellipse cx="27.16" cy="43.75" rx="27.16" ry="43.75" transform="matrix(0.9196 -0.3927 0.3192 0.9476 0 52.09)" fill="currentColor" />
             <ellipse cx="117.12" cy="50.82" rx="27.15" ry="46.82" fill="currentColor" />
@@ -27,15 +27,25 @@ const PawSVG = (props: { className?: string }) => (
 );
 
 const PawRow = () => {
-    const paws = Array(15).fill(0);
+    const paws = Array(6).fill(0);
     return (
         <div className="relative w-full overflow-hidden">
             <div className="flex animate-marquee">
-                <div className="flex-shrink-0 flex items-center justify-around min-w-full">
-                    {paws.map((_, i) => <PawSVG key={i} className="animate-wiggle text-brand-pink" />)}
+                <div className="flex-shrink-0 flex items-center justify-around min-w-full gap-12 md:gap-32 px-4">
+                    {paws.map((_, i) => (
+                        <PawSVG
+                            key={i}
+                            className="animate-wiggle text-brand-pink w-10 h-10 md:w-28 md:h-28 opacity-60"
+                        />
+                    ))}
                 </div>
-                <div className="flex-shrink-0 flex items-center justify-around min-w-full">
-                    {paws.map((_, i) => <PawSVG key={i} className="animate-wiggle text-brand-pink" />)}
+                <div className="flex-shrink-0 flex items-center justify-around min-w-full gap-12 md:gap-32 px-4">
+                    {paws.map((_, i) => (
+                        <PawSVG
+                            key={i}
+                            className="animate-wiggle text-brand-pink w-10 h-10 md:w-28 md:h-28 opacity-60"
+                        />
+                    ))}
                 </div>
             </div>
         </div>
@@ -45,22 +55,23 @@ const PawRow = () => {
 
 export default function LoadingSpinner({ mainText, subText }: LoadingSpinnerProps) {
     return (
-        // ✅ 1. justify-between을 제거하고, 각 부분의 간격을 직접 제어.
-        <div className="w-screen h-screen bg-white flex flex-col items-center">
+        <div className="w-screen h-screen bg-white flex flex-col items-center fixed inset-0 z-50">
 
-            {/* 위쪽 발바닥 (pt-12로 위쪽 여백) */}
-            <div className="pt-12">
+            <div className="pt-8 md:pt-16 w-full">
                 <PawRow />
             </div>
 
-            {/* ✅ 2. flex-1을 추가. */}
-            <div className="flex-1 flex flex-col items-center justify-center text-center">
-                <h1 className="font-kyobo text-6xl mb-4 tracking-widest">{mainText}</h1>
-                <p className="font-kyobo text-4xl text-gray-500">{subText}</p>
+            <div className="flex-1 flex flex-col items-center justify-center text-center px-6">
+                <h1 className="font-kyobo text-3xl md:text-7xl mb-4 md:mb-8 tracking-widest break-keep whitespace-pre-wrap leading-tight">
+                    {mainText}
+                </h1>
+
+                <p className="font-kyobo text-xl md:text-4xl text-gray-500 break-keep">
+                    {subText}
+                </p>
             </div>
 
-            {/* 아래쪽 발바닥 (pb-12로 아래쪽 여백) */}
-            <div className="pb-12">
+            <div className="pb-8 md:pb-16 w-full">
                 <PawRow />
             </div>
 

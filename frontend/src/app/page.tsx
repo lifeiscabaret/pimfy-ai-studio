@@ -1,120 +1,108 @@
 'use client';
 
-import { useState, useEffect } from 'react';
-import StartPageContent from './StartPageContent';
-import MungsaengPage from './mungsaeng/MungsaengPage';
-import ProfilePage from './profile/ProfilePage';
-import SelectStep from './profile/SelectStep';
-import AdoptionCreateStep from './profile/AdoptionCreateStep';   // 핌피바이러스 프로필(검색/선택)
-import GeneralCreateStep from './profile/GeneralCreateStep';     // 입양·임보 프로필(수동작성)
-import StudioCreateStep from './profile/StudioCreateStep';
-import LoadingSpinner from '@/components/ui/LoadingSpinner';
-import ReadyStep from './profile/ReadyStep';
+import { useState } from 'react';
 
-type PageState =
-  | 'start'
-  | 'mungsaeng'
-  | 'profile'
-  | 'profileSelect'
-  | 'profileAdoptionCreate'   // ✅ 핌피바이러스 프로필
-  | 'profileGeneralCreate'    // ✅ 입양·임보 프로필
-  | 'studioCreate'
-  | 'profileGenerating'
-  | 'profileReady';
+// 같은 폴더에 있는 파일들 임포트
+import ProfilePage from '@/app/profile/ProfilePage';
+import SelectStep, { ProfileType } from '@/app/profile/SelectStep';
+import AdoptionCreateStep from '@/app/profile/AdoptionCreateStep';
+import GeneralCreateStep from '@/app/profile/GeneralCreateStep';
+import StudioCreateStep from '@/app/profile/StudioCreateStep';
+import ReadyStep from '@/app/profile/ReadyStep';
+import StartPageContent from '@/app/StartPageContent'; // ⭐️ [추가] 초기 화면 임포트
 
-// (선택) 핌피바이러스 프로필에서 선택한 강아지 보관하고 싶으면 타입 선언
-interface DogProfile {
-  id: number; name: string; breed: string; age: number;
-  story: string; imageUrl: string; shelter: string;
-}
+// 화면 단계 정의
+type ViewState = 'start' | 'main' | 'mungsaeng' | 'select' | 'pimfy' | 'adoption' | 'studio' | 'ready';
 
-export default function Home() {
-  const [currentPage, setCurrentPage] = useState<PageState>('start');
-  const [selectedDogForProfile, setSelectedDogForProfile] = useState<DogProfile | null>(null);
+export default function Page() {
+  // ⭐️ [수정] 초기 상태는 'start' (대문 화면)
+  const [view, setView] = useState<ViewState>('start');
+  const [resultData, setResultData] = useState<any>(null);
 
-  const goToHome = () => setCurrentPage('start');
-
-  useEffect(() => {
-    if (currentPage === 'profileGenerating') {
-      const t = setTimeout(() => setCurrentPage('profileReady'), 3000);
-      return () => clearTimeout(t);
-    }
-  }, [currentPage]);
-
-  // ✅ 선택 화면에서 옵션별로 '다른 상태'로 보냄
-  const handleSelectProfileType = (type: 'pimfy' | 'adoption' | 'studio') => {
-    console.log('[Select] type =', type);
-    if (type === 'pimfy') {
-      setCurrentPage('profileAdoptionCreate');   // 핌피바이러스 → AdoptionCreateStep
-    } else if (type === 'adoption') {
-      setCurrentPage('profileGeneralCreate');    // 입양·임보 → GeneralCreateStep
-    } else if (type === 'studio') {
-      setCurrentPage('studioCreate');
-    }
+  // 메인 메뉴 네비게이션
+  const handleMainNavigate = (page: 'start' | 'mungsaeng' | 'profile' | 'profileSelect') => {
+    if (page === 'mungsaeng') setView('mungsaeng');
+    if (page === 'profileSelect') setView('select');
   };
 
-  // General / Studio 완료 시
-  const handleCreateComplete = () => {
-    console.log('[Create] general/studio complete');
-    setCurrentPage('profileGenerating');
+  // 프로필 타입 선택
+  const handleProfileSelect = (type: ProfileType) => {
+    setView(type);
   };
 
-  // 핌피바이러스(검색/선택) 완료 시
-  const handleDogSelectionComplete = (dogData: DogProfile) => {
-    console.log('[Create] pimfy selected dog =', dogData);
-    setSelectedDogForProfile(dogData);
-    setCurrentPage('profileGenerating');
+  // 생성 완료 핸들러
+  const handleComplete = (data: any) => {
+    console.log("생성 완료 데이터:", data);
+    setResultData(data);
+    setView('ready');
   };
 
-  const renderPage = () => {
-    switch (currentPage) {
-      case 'mungsaeng':
-        return <MungsaengPage onBack={() => setCurrentPage('profile')} onGoHome={goToHome} />;
+  return (
+    <main className="min-h-screen bg-mint">
 
-      case 'profileGenerating':
-        return <LoadingSpinner mainText="견생 프로필" subText="(사진 생성중)" />;
+      {/* 0. ⭐️ 초기 대문 화면 (ENTER 누르면 main으로 이동) */}
+      {view === 'start' && (
+        <StartPageContent onStart={() => setView('main')} />
+      )}
 
-      case 'profileReady':
-        return (
-          <div className="flex min-h-screen items-center justify-center bg-mint p-4">
-            <ReadyStep onRetry={() => setCurrentPage('profileSelect')} onGoHome={goToHome}
-            // selectedDog={selectedDogForProfile} // 필요 시 사용
-            />
+      {/* 1. 메인 메뉴 */}
+      {view === 'main' && (
+        <ProfilePage
+          onBack={() => setView('start')} // 뒤로가기 하면 다시 대문으로
+          onNavigate={handleMainNavigate}
+        />
+      )}
+
+      {/* 2. 멍생네컷 */}
+      {view === 'mungsaeng' && (
+        <div className="flex h-screen items-center justify-center">
+          <div className="text-center">
+            <h2 className="font-kyobo text-2xl mb-4">멍생네컷 기능은 준비 중입니다! 📸</h2>
+            <button onClick={() => setView('main')} className="bg-white px-4 py-2 rounded shadow">돌아가기</button>
           </div>
-        );
+        </div>
+      )}
 
-      // ✅ 핌피바이러스 프로필 = 검색/선택 화면
-      case 'profileAdoptionCreate':
-        return (
-          <AdoptionCreateStep
-            onBack={() => setCurrentPage('profileSelect')}
-            onComplete={handleDogSelectionComplete}
-          />
-        );
+      {/* 3. 프로필 타입 선택 */}
+      {view === 'select' && (
+        <SelectStep
+          onSelect={handleProfileSelect}
+          onBack={() => setView('main')}
+        />
+      )}
 
-      // ✅ 입양·임보 프로필 = 업로드 + 입력 폼 화면
-      case 'profileGeneralCreate':
-        return (
-          <GeneralCreateStep
-            onBack={() => setCurrentPage('profileSelect')}
-            onComplete={handleCreateComplete}
-          />
-        );
+      {/* 4. 핌피바이러스(공고) 프로필 */}
+      {view === 'pimfy' && (
+        <AdoptionCreateStep
+          onComplete={handleComplete}
+          onBack={() => setView('select')}
+        />
+      )}
 
-      case 'studioCreate':
-        return <StudioCreateStep onBack={() => setCurrentPage('profileSelect')} onComplete={handleCreateComplete} />;
+      {/* 5. 입양(수동) 프로필 */}
+      {view === 'adoption' && (
+        <GeneralCreateStep
+          onComplete={handleComplete}
+          onBack={() => setView('select')}
+        />
+      )}
 
-      case 'profileSelect':
-        return <SelectStep onBack={() => setCurrentPage('profile')} onSelect={handleSelectProfileType} />;
+      {/* 6. 스튜디오 프로필 */}
+      {view === 'studio' && (
+        <StudioCreateStep
+          onComplete={handleComplete}
+          onBack={() => setView('select')}
+        />
+      )}
 
-      case 'profile':
-        return <ProfilePage onBack={goToHome} onNavigate={setCurrentPage} />;
-
-      case 'start':
-      default:
-        return <StartPageContent onNavigate={setCurrentPage} />;
-    }
-  };
-
-  return <main>{renderPage()}</main>;
+      {/* 7. 결과 화면 */}
+      {view === 'ready' && (
+        <ReadyStep
+          profileData={resultData}
+          onRetry={() => setView('select')}
+          onGoHome={() => setView('main')}
+        />
+      )}
+    </main>
+  );
 }

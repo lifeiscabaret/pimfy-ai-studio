@@ -1,3 +1,24 @@
-nohup.out
+# 1. 보안 파일
+.env
+.env.local
+
+# 2. 용량 큰 AI 모델 파일
 *.pth
 *.engine
+*.ckpt
+*.safetensors
+
+# 3. 생성된 이미지 및 데이터
+generated_images/
+logos/
+gpu_memory_log.csv
+
+# 4. 파이썬/시스템 임시 파일
+__pycache__/
+*.pyc
+.DS_Store
+nohup.out
+
+# 5. 중첩 폴더 문제 방지 (프론트엔드 등)
+frontend/
+next/

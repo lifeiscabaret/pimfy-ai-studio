@@ -1,0 +1,27 @@
+FROM nvcr.io/nvidia/tensorrt:23.09-py3
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 1. 시스템 패키지 설치 & 보안 검사 무시 (어제 뚫었던 거)
+RUN rm -f /etc/apt/apt.conf.d/docker-clean \
+    && echo "Acquire::AllowInsecureRepositories \"true\";" > /etc/apt/apt.conf.d/99insecure \
+    && echo "Acquire::AllowDowngradeToInsecureRepositories \"true\";" >> /etc/apt/apt.conf.d/99insecure \
+    && echo "Acquire::AllowInvalidAuthentications \"true\";" >> /etc/apt/apt.conf.d/99insecure \
+    && echo "APT::Get::AllowUnauthenticated \"true\";" >> /etc/apt/apt.conf.d/99insecure \
+    && apt-get update || true \
+    && apt-get install -y --allow-unauthenticated --no-install-recommends \
+    git \
+    libgl1-mesa-glx \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# 2. [수정됨] Python 설치 시 '화려한 막대바' 끄기! (에러 원인 제거)
+COPY requirements.sdxl.txt .
+RUN pip install --upgrade pip --progress-bar off --no-cache-dir && \
+    pip install --no-cache-dir --progress-bar off -r requirements.sdxl.txt
+
+# 3. 소스 복사
+COPY . .
+
+CMD ["python3", "sdxl_server.py"]

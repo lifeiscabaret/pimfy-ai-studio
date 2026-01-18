@@ -1,3 +1,7 @@
 .env
 BasicSR/
+__pycache__/
 *.pth
+generated_images/
+fonts/
+

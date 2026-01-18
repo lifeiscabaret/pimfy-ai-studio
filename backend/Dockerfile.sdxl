@@ -1,0 +1,31 @@
+# 1. Nvidia TensorRT 대신 PyTorch 공식 이미지 사용.
+FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-devel
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 2. 시스템 패키지 설치 (보안 무시 설정 포함)
+RUN rm -f /etc/apt/apt.conf.d/docker-clean \
+    && echo "Acquire::AllowInsecureRepositories \"true\";" > /etc/apt/apt.conf.d/99insecure \
+    && echo "Acquire::AllowDowngradeToInsecureRepositories \"true\";" >> /etc/apt/apt.conf.d/99insecure \
+    && echo "Acquire::AllowInvalidAuthentications \"true\";" >> /etc/apt/apt.conf.d/99insecure \
+    && echo "APT::Get::AllowUnauthenticated \"true\";" >> /etc/apt/apt.conf.d/99insecure \
+    && apt-get update || true \
+    && apt-get install -y --allow-unauthenticated --no-install-recommends \
+    git \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# 3. 라이브러리 설치
+COPY ./backend/requirements.sdxl.txt .
+RUN pip install --upgrade pip --progress-bar off --no-cache-dir && \
+    pip install --no-cache-dir --progress-bar off -r requirements.sdxl.txt && \
+    pip install --upgrade transformers
+
+# 4. 소스 파일 전체 복사
+COPY . .
+
+# 5. SDXL 서버 실행
+CMD ["python3", "sdxl_server.py"]

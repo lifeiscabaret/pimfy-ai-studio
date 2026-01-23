@@ -1,4 +1,7 @@
 # --- 전역 패치: torch 버전 인자 호환성 문제 해결 ---
+#Mcp용
+from mcp.server.fastmcp import FastMCP
+
 import torch.utils._pytree as _pytree
 def patched_register(node_type, flatten_fn, unflatten_fn, serialized_type_name=None):
     return _pytree._register_pytree_node(node_type, flatten_fn, unflatten_fn)
@@ -13,7 +16,7 @@ except ImportError:
     import sys
     sys.modules["torchvision.transforms.functional_tensor"] = F
 
-from fastapi import FastAPI, HTTPException, File, UploadFile, Form
+from fastapi import FastAPI, Request, HTTPException, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware 
 from fastapi.staticfiles import StaticFiles
 import uuid 
@@ -108,6 +111,8 @@ class RealProfileRequest(BaseModel):
 
 models = {}
 app = FastAPI()
+#Mcp용
+mcp = FastMCP("PimfyVirus")
 
 app.add_middleware(
     CORSMiddleware,
@@ -118,7 +123,8 @@ app.add_middleware(
 )
 
 os.makedirs("generated_images", exist_ok=True)
-app.mount("/images", StaticFiles(directory="/app/generated_images"), name="images")
+#app.mount("/images", StaticFiles(directory="/app/generated_images"), name="images")
+app.mount("/images", StaticFiles(directory="generated_images"), name="images")
 
 if torch.cuda.is_available():
     device = "cuda"
@@ -128,7 +134,7 @@ else:
     device = "cpu"
     gpu_id = None
 
-SDXL_SERVICE_URL = "http://localhost:8000/generate/background"
+SDXL_SERVICE_URL = "http://localhost:8001/generate/background"
 
 @app.on_event("startup")
 def load_models_and_db():
@@ -165,18 +171,23 @@ def create_framed_image(pil_img: Image.Image) -> Image.Image:
 
 def attach_logo_bottom_center(base_img: Image.Image) -> Image.Image:
     try:
-        logo_dir = "logos"
-        if not os.path.exists(logo_dir): return base_img
+        logo_dir = "/app/logos"
+        if not os.path.exists(logo_dir): 
+            return base_img
         logo_files = [f for f in os.listdir(logo_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-        if not logo_files: return base_img
+        if not logo_files: 
+            return base_img
         
         logo = Image.open(os.path.join(logo_dir, random.choice(logo_files))).convert("RGBA")
         base_img = base_img.convert("RGBA")
         target_width = int(base_img.size[0] * 0.10)
         logo = logo.resize((target_width, int(logo.height * (target_width / logo.width))), Image.LANCZOS)
+        
+        # 로고 합성 위치 및 마스크 적용 (투명도 유지)
         base_img.paste(logo, ((base_img.size[0] - target_width) // 2, base_img.size[1] - logo.height - 15), logo)
         return base_img.convert("RGB")
-    except: return base_img.convert("RGB")
+    except: 
+        return base_img.convert("RGB")
 
 async def get_dog_details(dog_uid: int) -> Dog:
     db = await get_db_connection()
@@ -211,17 +222,20 @@ def remove_emojis(text):
     return re.sub(r'[^\w\s,.\-?!@#%&()가-힣/]', '', text).strip() if text else ""
 
 async def call_sdxl_service(base64_dog_image: str, dog_info: dict) -> Image.Image:
-    color_prompts = ["Soft Pastel Pink", "Creamy Yellow", "Light Baby Blue", "Mint Green", "Lavender Purple", "Warm Peach", "Off-White and Beige"]
-    selected = random.choice(color_prompts)
-    print(f"🎨 Color: {selected}")
-    prompt = f"{selected} background, minimalist aesthetic, clean interior, cozy atmosphere, high quality, soft focus, instagram vibe."
+    # 🎨 복잡한 로직 다 필요 없이, 바로 시연용 단색 배경을 생성해서 반환합니다.
+    return Image.new('RGB', (1080, 1350), (255, 240, 245))
+#async def call_sdxl_service(base64_dog_image: str, dog_info: dict) -> Image.Image:
+   # color_prompts = ["Soft Pastel Pink", "Creamy Yellow", "Light Baby Blue", "Mint Green", "Lavender Purple", "Warm Peach", "Off-White and Beige"]
+   # selected = random.choice(color_prompts)
+   # print(f"🎨 Color: {selected}")
+   # prompt = f"{selected} background, minimalist aesthetic, clean interior, cozy atmosphere, high quality, soft focus, instagram vibe."
     
-    try:
-        async with httpx.AsyncClient(timeout=100.0) as client:
-            res = await client.post(SDXL_SERVICE_URL, json={"base64_dog_image": base64_dog_image, "prompt": prompt})
-            res.raise_for_status()
-            return Image.open(io.BytesIO(base64.b64decode(res.json().get("base64_background_image")))).convert("RGB")
-    except: return Image.new('RGB', (1080, 1350), (255, 240, 245))
+   # try:
+       # async with httpx.AsyncClient(timeout=100.0) as client:
+           # res = await client.post(SDXL_SERVICE_URL, json={"base64_dog_image": base64_dog_image, "prompt": prompt})
+           # res.raise_for_status()
+           # return Image.open(io.BytesIO(base64.b64decode(res.json().get("base64_background_image")))).convert("RGB")
+   # except: return Image.new('RGB', (1080, 1350), (255, 240, 245))
 
 def generate_dog_text(dog: Dog) -> Dict:
     raw_name = dog.subject
@@ -363,12 +377,48 @@ async def generate_adoption_profile(image: UploadFile = File(...), name: str = F
             draw_text_with_stroke(draw, (1080-get_text_width(draw, line, fb))//2, cy, line, fb, (50,50,50), (255,255,255), 2)
             cy += 50
             
+        # 하단 로고 합성
         template = attach_logo_bottom_center(template)
         
         fname = f"{uuid.uuid4()}.jpg"
-        template.save(f"/app/generated_images/{fname}", quality=90)
+        # ✅ 아래 모든 줄은 스페이스바 8칸으로 들여쓰기를 맞췄습니다.
+        template.save(f"generated_images/{fname}", quality=90)
         return {"profile_text": '\n'.join(lines), "profile_image_base64": "", "image_url": f"{CURRENT_SERVER_URL}/images/{fname}"}
-    except: raise HTTPException(422, "Error")
+    except Exception as e:
+        print(f"🚨 Adoption Profile Error: {e}")
+        raise HTTPException(422, "Error")
+
+#Mcp
+@mcp.tool()
+async def generate_studio_profile_mcp(base64_image: str, bg_color: str = "#FFD1DC"):
+    """
+    유기견 사진(base64)을 받아 스튜디오 스타일 프로필을 생성합니다.
+    """
+    if "upsampler" not in models: return {"message": "모델 로딩 중..."}
+    
+    try:
+        # Base64 데이터를 이미지로 변환
+        img_data = base64.b64decode(base64_image)
+        img = Image.open(io.BytesIO(img_data)).convert("RGB")
+        
+        # --- 이후 로직은 기존과 동일 ---
+        if max(img.size) > 1280: img.thumbnail((1280, 1280), Image.LANCZOS)
+        
+        # (중략: 기존 업스케일링 및 누끼 로직)
+        
+        no_bg = remove(img, session=models["remover"], alpha_matting=True)
+        # ... (중략) ...
+
+        fname = f"{uuid.uuid4()}.jpg"
+       # template.save(f"generated_images/{fname}", quality=90)
+        template.save(f"generated_images/{fname}", quality=90)
+
+        return {
+            "image_url": f"{CURRENT_SERVER_URL}/images/{fname}",
+            "message": "성공적으로 생성되었습니다."
+        }
+    except Exception as e:
+        return {"message": f"에러 발생: {str(e)}"}
 
 @app.post("/api/v1/generate-studio-profile")
 async def generate_studio_profile(image: UploadFile = File(...), bg_color: str = Form("#FFD1DC")):
@@ -423,3 +473,19 @@ async def search_dogs(name: str):
             "shelter": safe_dec(r['addinfo12']) or "정보 없음"
         })
     return res
+
+#if __name__ == "__main__":
+   # import uvicorn
+   # import threading
+
+    # 1. MCP 서버는 8002번으로! (8001은 SDXL 전용)
+    def run_mcp():
+        import os  # <-- 여기서부터는 반드시 8칸(또는 2개의 탭) 들여쓰기가 되어야 합니다.
+        os.environ["MCP_PORT"] = "8002" 
+        mcp.run(transport="sse")
+
+    # threading 부분은 def와 같은 세로 라인에 맞춰야 합니다.
+    threading.Thread(target=run_mcp, daemon=True).start()
+
+    # 2. 메인 FastAPI는 변함없이 8000번
+   # uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -9,6 +9,11 @@
   <i>(왼쪽: 원본 유기동물 공고 데이터 / 오른쪽: AI를 통해 생성된 맞춤형 프로필)</i>
 </p>
 
+![Python](https://img.shields.io/badge/python-3670A0?style=for-the-badge&logo=python&logoColor=ffdd54)
+![FastAPI](https://img.shields.io/badge/FastAPI-005571?style=for-the-badge&logo=fastapi)
+![MySQL](https://img.shields.io/badge/mysql-%2300f.svg?style=for-the-badge&logo=mysql&logoColor=white)
+![Docker](https://img.shields.io/badge/docker-%230db7ed.svg?style=for-the-badge&logo=docker&logoColor=white)
+![NCP](https://img.shields.io/badge/NAVER%20Cloud-03C75A?style=for-the-badge&logo=naver&logoColor=white)
 ## 📝 프로젝트 개요 (Overview)
 기존 유기견 공고 사진의 열악한 시각적 환경을 개선하기 위해 시작되었습니다. **PIMFY Photo**는 생성형 AI 기술을 활용해 유기견의 '가장 빛나는 순간'을 재구성하고, 데이터를 기반으로 감성적인 페르소나를 부여하여 실질적인 입양률 제고를 목표로 합니다.
 

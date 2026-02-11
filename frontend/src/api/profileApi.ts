@@ -1,7 +1,6 @@
-// src/api/profileApi.ts
+// 백엔드 서버 주소 (이전 서버)
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
-// 📡 백엔드 서버 주소 (배포 시 IP 확인 필수!)
-const API_BASE_URL = "http://211.188.58.199:8000";
 
 // 1️⃣ [입양/임보 프로필] 생성 함수 (contact 추가)
 export const createAdoptionProfile = async (
@@ -10,7 +9,7 @@ export const createAdoptionProfile = async (
     age: string,
     personality: string,
     features: string,
-    contact?: string 
+    contact?: string
 ) => {
     const formData = new FormData();
     formData.append("image", file);

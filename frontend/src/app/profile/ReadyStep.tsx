@@ -2,7 +2,6 @@
 
 import { useState, useEffect } from 'react';
 
-// ... (아이콘들은 기존 코드 유지) ...
 const IconKakao = () => (<svg viewBox="0 0 32 32" className="w-6 h-6"><path fill="currentColor" d="M16 4.64c-6.96 0-12.64 4.48-12.64 10.08 0 3.52 2.32 6.64 5.76 8.48l-.96 3.52.96-.08 3.2-2.24c1.2.32 2.48.56 3.68.56 6.96 0 12.64-4.48 12.64-10.24S22.96 4.64 16 4.64z" /></svg>);
 const IconInstagram = () => (<svg viewBox="0 0 24 24" className="w-6 h-6" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="2" width="20" height="20" rx="5" ry="5"></rect><path d="M16 11.37A4 4 0 1 1 12.63 8 4 4 0 0 1 16 11.37z"></path><line x1="17.5" y1="6.5" x2="17.51" y2="6.5"></line></svg>);
 const IconSave = () => (<svg viewBox="0 0 24 24" className="w-6 h-6" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>);
@@ -20,7 +19,7 @@ export default function ReadyStep({ profileData, onRetry, onGoHome }: ReadyStepP
         // @ts-ignore
         if (window.Kakao && !window.Kakao.isInitialized()) {
             // @ts-ignore
-            window.Kakao.init('592b68bdf6a6bf3da19b7a6d958723b1'); 
+            window.Kakao.init('592b68bdf6a6bf3da19b7a6d958723b1');
         }
     }, []);
 
@@ -31,7 +30,7 @@ export default function ReadyStep({ profileData, onRetry, onGoHome }: ReadyStepP
         }
 
         const shareImage = profileData?.image_url || '';
-        const currentDomain = window.location.origin; // 예: http://localhost:3000
+        const currentDomain = window.location.origin; // http://localhost:3000
 
         // [핵심 변경]
         const resultPageUrl = `${currentDomain}/result?img=${encodeURIComponent(shareImage)}`;
@@ -44,22 +43,22 @@ export default function ReadyStep({ profileData, onRetry, onGoHome }: ReadyStepP
                 description: '세상에 단 하나뿐인 우리 아이의 프로필을 확인해보세요! ✨',
                 imageUrl: shareImage,
                 link: {
-                    mobileWebUrl: resultPageUrl, 
-                    webUrl: resultPageUrl,       
+                    mobileWebUrl: resultPageUrl,
+                    webUrl: resultPageUrl,
                 },
             },
             buttons: [
                 {
                     title: '프로필 보러가기',
                     link: {
-                        mobileWebUrl: resultPageUrl, 
+                        mobileWebUrl: resultPageUrl,
                         webUrl: resultPageUrl,
                     },
                 },
                 {
-                    title: '나도 만들기', 
+                    title: '나도 만들기',
                     link: {
-                        mobileWebUrl: currentDomain, 
+                        mobileWebUrl: currentDomain,
                         webUrl: currentDomain,
                     },
                 },
@@ -72,17 +71,38 @@ export default function ReadyStep({ profileData, onRetry, onGoHome }: ReadyStepP
         window.location.href = "instagram://app";
     };
 
-    const handleDownloadImage = () => {
-        if (!profileData?.profile_image_base64) return alert("저장할 이미지가 없습니다.");
-        const link = document.createElement("a");
-        link.href = `data:image/jpeg;base64,${profileData.profile_image_base64}`;
-        link.download = "pimfy_profile.jpg";
-        link.click();
+    const handleDownloadImage = async () => {
+        // [수정] base64 대신 서버에서 준 image_url 사용.
+        const downloadUrl = profileData?.image_url;
+
+        if (!downloadUrl) {
+            return alert("저장할 이미지 주소가 없습니다. 다시 시도해주세요.");
+        }
+
+        try {
+            // CORS 문제를 해결하기 위해 fetch로 이미지를 가져와 Blob으로 변환.
+            const response = await fetch(downloadUrl);
+            const blob = await response.blob();
+            const url = window.URL.createObjectURL(blob);
+
+            const link = document.createElement("a");
+            link.href = url;
+            link.download = `pimfy_profile_${Date.now()}.jpg`;
+            document.body.appendChild(link);
+            link.click();
+
+            // 사용한 객체 정리
+            document.body.removeChild(link);
+            window.URL.revokeObjectURL(url);
+        } catch (error) {
+            console.error("다운로드 에러:", error);
+            // 다운로드가 실패시, 새 탭에서 이미지 띄워주기.
+            window.open(downloadUrl, '_blank');
+        }
     };
 
-    const imgSrc = profileData?.profile_image_base64
-        ? `data:image/jpeg;base64,${profileData.profile_image_base64}`
-        : null;
+    const imgSrc = profileData?.image_url ||
+        (profileData?.profile_image_base64 ? `data:image/jpeg;base64,${profileData.profile_image_base64}` : null);
 
     return (
         <div className="flex min-h-screen items-center justify-center bg-mint p-4">
